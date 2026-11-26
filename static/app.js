@@ -211,7 +211,12 @@ vec3 srgbToLinear(vec3 c) {
 }
 
 void main() {
-  outColor = vec4(srgbToLinear(texture(u_src, v_uv).rgb), 1.0);
+  // The shared vertex shader flips V (it maps screen-top to v=0 for the
+  // on-screen pass). Rendering into a texture with that same flip would
+  // store the photo upside down — framebuffer rows are not flipped — so
+  // flip V back here and make the pre-pass an exact copy in texture space.
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  outColor = vec4(srgbToLinear(texture(u_src, uv).rgb), 1.0);
 }`;
 
   /* -------------------------------------------------------------- webgl init */
