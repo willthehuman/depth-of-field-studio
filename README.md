@@ -88,4 +88,22 @@ data/<id>/          cached photo.png + depth.f16 + meta.json (last 8 photos)
   in metres from a monocular cue, and the absolute scale is approximate on
   unusual scenes (very wide lenses, heavy crops, macro). Relative depth is solid.
 * Sky is infinite depth: it gets the maximum blur, which is what you want.
-* Weights are released under Apple's ML research licence (non-commercial).
+
+## Licence
+
+The **code** here is MIT — see [LICENSE](LICENSE).
+
+This repository is not a redistribution of Depth Pro 2, and the MIT licence does
+not extend to Apple's material:
+
+* **Model weights** — `apple/DepthPro2-H` and `apple/DepthPro2-focal` are
+  downloaded at runtime under the
+  [Apple Machine Learning Research Model Licence](https://github.com/apple-aiml-research/ml-depth-pro-2/blob/main/LICENSE_MODEL):
+  **non-commercial scientific research and academic development only**. Nothing
+  in this repo grants rights to those weights or to the `ml-depth-pro-2`
+  package.
+* **Sample image** — `static/sample.jpg` and the renders in `docs/` come from
+  Apple's example photo in that repository and are included only so the "Try a
+  sample" button works. Treat them as research-use material, and replace them if
+  you redistribute this project.
+
