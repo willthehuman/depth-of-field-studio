@@ -46,11 +46,11 @@ launches take ~12 s to build the model on the CPU and hand it to the GPU.
 
 | | |
 |---|---|
-| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a guided filter so silhouettes stay aligned with the photo. ~1.5–2.5 s for a photo, ~4 s for a 27 MP one. |
+| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. ~1.5–2.5 s for a photo, ~4 s for a 27 MP one. |
 | **Focus** | Slider, *Auto* (median of the centre), *Centre*, or click anywhere in the photo. Distances are in metres, straight from the model. |
 | **Aperture** | f/1.0 → f/22 in third stops. |
 | **Lens** | *Native* uses the focal length the model estimates; 50/85/135 mm simulate a longer lens, which is how you get a portrait look out of a wide-angle frame. |
-| **Render** | WebGL2 disc-gather bokeh, 96 taps while you drag, 192 on export. The gather runs in **linear light**: the photo is decoded from sRGB into a half-float texture first, near-clipped highlights are expanded back above 1.0 so speculars render as glowing discs, and the result is encoded back to sRGB. Scatter-as-gather weighting keeps the in-focus subject from bleeding into the background. |
+| **Render** | WebGL2 layered bokeh in **linear light**. Premultiplied near/far layers retain real edge coverage; a mip pyramid fills occluded background and pre-filters the blur, so 20 taps stay interactive and 40 taps are enough on export. A fixed nine-blade polygon gives consistent aperture character, with light cat's-eye clipping toward the corners. Near-clipped highlights are expanded back above 1.0 before compositing, then the result is encoded to sRGB. |
 | **Export** | Full-resolution JPEG/PNG rendered in the browser, plus the depth map as a PNG. |
 
 The depth-of-field band under the focus slider is the honest lens model

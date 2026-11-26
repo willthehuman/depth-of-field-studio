@@ -1,6 +1,6 @@
 /* Depth of Field Studio — client.
-   Depth is estimated once on the server; focus and aperture are a WebGL
-   gather-bokeh shader, so the sliders are instant and the export is full-res.
+   Depth is estimated once on the server; focus and aperture are a layered
+   WebGL bokeh pipeline, so the sliders are instant and the export is full-res.
    The gather runs in linear light: the photo is decoded from sRGB into a
    half-float texture first (see buildLinearTexture), near-clipped highlights
    are expanded back above 1.0 so bokeh discs carry real energy, and the
@@ -12,7 +12,10 @@
 
   const FSTOPS = [1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5, 4.0, 4.5, 5.0,
     5.6, 6.3, 7.1, 8.0, 9.0, 10, 11, 13, 14, 16, 18, 20, 22];
-  const MAX_EXPORT = 8192;
+  const PREVIEW_TAPS = 20;
+  const EXPORT_TAPS = 40;
+  const MAX_WORK_PIXELS = 6_000_000;
+  const MAX_WORK_SIDE = 4096;
   const COC_LIMIT = 0.03; // 30 µm, the full-frame circle of confusion
 
   const S = {
@@ -33,13 +36,20 @@
     lowW: 0,
     lowH: 0,
     gl: null,
-    prog: null,
     progPre: null,
+    progFinal: null,
+    progLayer: null,
+    progBlur: null,
     locPre: {},
+    locFinal: {},
+    locLayer: {},
+    locBlur: {},
     fbo: null,
     linearOK: false,
+    colorFloat: false,
+    maxExport: 8192,
     tex: { photo: null, depth: null, linear: null },
-    loc: {},
+    targets: null,
     dirty: false,
     busy: false,
   };
@@ -54,148 +64,8 @@ void main() {
   gl_Position = vec4(a_pos, 0.0, 1.0);
 }`;
 
-  const FRAG = `#version 300 es
-precision highp float;
-precision highp sampler2D;
-
-in vec2 v_uv;
-out vec4 outColor;
-
-uniform sampler2D u_photo;  // linear-light copy of the photo (see PRE_FRAG)
-uniform sampler2D u_depth;
-uniform vec2  u_res;        // drawing buffer, px
-uniform vec2  u_tex;        // photo, px
-uniform float u_fpx;        // effective focal length, photo px
-uniform float u_fmm;        // effective focal length, mm on a 36 mm frame
-uniform float u_fstop;
-uniform float u_focus;      // metres
-uniform float u_scale;      // drawing-buffer px per photo px
-uniform float u_blur;       // artistic multiplier
-uniform float u_highlight;
-uniform float u_maxblur;
-uniform float u_dnear;
-uniform float u_dfar;
-uniform int   u_mode;       // 0 dof, 1 depth, 2 original
-uniform int   u_taps;
-uniform int   u_linear;     // 1 when u_photo is the linear-light texture
-
-const int MAXTAPS = 192;
-const float GOLDEN = 2.399963229728653;
-
-// The gather accumulates in linear light; the canvas expects sRGB, so the
-// result is encoded once, here, at the very end. When the linear pipeline is
-// unavailable (u_linear == 0) u_photo holds the raw sRGB photo and encoding
-// is skipped: the legacy gamma-space render, minus highlight emphasis,
-// which only exists in the linear pipeline.
-vec3 linearToSrgb(vec3 c) {
-  c = max(c, vec3(0.0));
-  vec3 lo = c * 12.92;
-  vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-  return mix(lo, hi, step(vec3(0.0031308), c));
-}
-
-vec3 encode(vec3 c) {
-  return u_linear == 1 ? linearToSrgb(c) : c;
-}
-
-// Pseudo-HDR reconstruction. A sample clipped at 1.0 in the source photo was
-// "1.0 or more" at the sensor; expanding near-clipped samples smoothly back
-// above 1.0 gives the gather real energy to spread, so a specular point
-// renders as a glowing disc instead of a grey smear. The spread argument
-// scales the gain by how far the sample's own light travels (its blur radius): an in-focus highlight does
-// not expand, so the focus boundary stays clean. u_highlight == 0 is exactly
-// neutral, and the gain multiplies the sample *value* — never its weight —
-// so colour balance is preserved.
-vec3 hdrExpand(vec3 c, float spread) {
-  float m = max(c.r, max(c.g, c.b));
-  float t = smoothstep(0.6, 1.0, m);
-  float gain = 1.0 + float(u_linear) * u_highlight * 24.0 * t * t * spread;
-  return c * gain;
-}
-
-float cocDiameter(float z) {
-  // Thin-lens circle of confusion, expressed in photo pixels.
-  float zmm = clamp(z, 0.05, 4000.0) * 1000.0;
-  float smm = clamp(u_focus, 0.05, 4000.0) * 1000.0;
-  float c = (u_fpx / max(u_fstop, 0.7)) * u_fmm * abs(1.0 / zmm - 1.0 / smm);
-  return c * u_blur * u_scale;
-}
-
-vec3 depthRamp(float t) {
-  // near (0) -> far (1); bright at both ends so the map reads as a photograph
-  const vec3 c0 = vec3(1.00, 0.30, 0.16);
-  const vec3 c1 = vec3(1.00, 0.70, 0.20);
-  const vec3 c2 = vec3(0.98, 0.95, 0.62);
-  const vec3 c3 = vec3(0.36, 0.86, 0.86);
-  const vec3 c4 = vec3(0.24, 0.45, 0.95);
-  t = clamp(t, 0.0, 1.0);
-  float s = t * 4.0;
-  if (s < 1.0) return mix(c0, c1, s);
-  if (s < 2.0) return mix(c1, c2, s - 1.0);
-  if (s < 3.0) return mix(c2, c3, s - 2.0);
-  return mix(c3, c4, s - 3.0);
-}
-
-float ign(vec2 p) {
-  return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
-}
-
-void main() {
-  vec3 base = texture(u_photo, v_uv).rgb;
-
-  if (u_mode == 2) { outColor = vec4(encode(base), 1.0); return; }
-
-  float z = texture(u_depth, v_uv).r;
-
-  if (u_mode == 1) {
-    float lz = log(max(z, 1e-3));
-    float t = (lz - log(u_dnear)) / max(log(u_dfar) - log(u_dnear), 1e-4);
-    outColor = vec4(depthRamp(clamp(t, 0.0, 1.0)), 1.0);
-    return;
-  }
-
-  float coc = min(cocDiameter(z), u_maxblur);
-  float radius = 0.5 * coc;
-  if (radius < 0.55) { outColor = vec4(encode(base), 1.0); return; }
-
-  float spin = ign(gl_FragCoord.xy) * 6.2831853;
-  vec3 sum = base;
-  float wsum = 1.0;
-
-  for (int i = 0; i < MAXTAPS; i++) {
-    if (i >= u_taps) break;
-    float fi = float(i) + 0.5;
-    float r = sqrt(fi / float(u_taps)) * radius;
-    float a = fi * GOLDEN + spin;
-    vec2 off = vec2(cos(a), sin(a)) * r / u_res;
-    vec2 suv = clamp(v_uv + off, vec2(0.0), vec2(1.0));
-
-    vec3 sc = textureLod(u_photo, suv, 0.0).rgb;
-    float sz = textureLod(u_depth, suv, 0.0).r;
-
-    // Scatter-as-gather: a neighbour only reaches this pixel if its own blur
-    // disc is at least as wide as the distance to it. Sharp foreground
-    // therefore stays clean instead of bleeding into the background.
-    float srad = 0.5 * min(cocDiameter(sz), u_maxblur);
-    float w = smoothstep(r - 1.5, r + 1.5, srad);
-
-    // Specular energy: near-clipped samples carry reconstructed HDR energy,
-    // scaled by how far their own light actually spreads.
-    float spread = smoothstep(0.5, 6.0, srad);
-    sc = hdrExpand(sc, spread);
-
-    sum += sc * w;
-    wsum += w;
-  }
-
-  vec3 col = sum / wsum;
-  outColor = vec4(encode(col), 1.0);
-}`;
-
   // Pre-pass: decode the sRGB photo into a linear-light texture, once per
-  // photo. Doing the decode here — instead of per tap in the gather — keeps
-  // the 192-tap loop free of pow() calls, and the half-float target holds
-  // the reconstructed highlight energy without clipping.
+  // photo, and build the source mip pyramid in linear space.
   const PRE_FRAG = `#version 300 es
 precision highp float;
 
@@ -211,12 +81,269 @@ vec3 srgbToLinear(vec3 c) {
 }
 
 void main() {
-  // The shared vertex shader flips V (it maps screen-top to v=0 for the
-  // on-screen pass). Rendering into a texture with that same flip would
-  // store the photo upside down — framebuffer rows are not flipped — so
-  // flip V back here and make the pre-pass an exact copy in texture space.
+  // Framebuffer rows are bottom-up while v_uv is top-down for the on-screen
+  // pass. Flip here so this texture has the same orientation as the photo.
   vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
   outColor = vec4(srgbToLinear(texture(u_src, uv).rgb), 1.0);
+}`;
+
+  // The final pass doubles as the original/depth preview. In DOF mode the
+  // near layer is premultiplied and the far layer has been filled by its mip
+  // pyramid, so the physical order is simply near over far.
+  const FINAL_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_photo;
+uniform sampler2D u_depth;
+uniform sampler2D u_near;
+uniform sampler2D u_far;
+uniform float u_fpx;
+uniform float u_fmm;
+uniform float u_fstop;
+uniform float u_focus;
+uniform float u_scale;
+uniform float u_blur;
+uniform float u_maxblur;
+uniform float u_dnear;
+uniform float u_dfar;
+uniform int u_mode;
+uniform int u_linear;
+
+const float PI = 3.14159265359;
+
+vec3 linearToSrgb(vec3 c) {
+  c = max(c, vec3(0.0));
+  vec3 lo = c * 12.92;
+  vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+  return mix(lo, hi, step(vec3(0.0031308), c));
+}
+
+vec3 encode(vec3 c) {
+  return u_linear == 1 ? linearToSrgb(c) : c;
+}
+
+float cocDiameter(float z) {
+  float zmm = clamp(z, 0.05, 4000.0) * 1000.0;
+  float smm = clamp(u_focus, 0.05, 4000.0) * 1000.0;
+  float c = (u_fpx / max(u_fstop, 0.7)) * u_fmm * abs(1.0 / zmm - 1.0 / smm);
+  return c * u_blur * u_scale;
+}
+
+vec3 depthRamp(float t) {
+  const vec3 c0 = vec3(1.00, 0.30, 0.16);
+  const vec3 c1 = vec3(1.00, 0.70, 0.20);
+  const vec3 c2 = vec3(0.98, 0.95, 0.62);
+  const vec3 c3 = vec3(0.36, 0.86, 0.86);
+  const vec3 c4 = vec3(0.24, 0.45, 0.95);
+  t = clamp(t, 0.0, 1.0);
+  float s = t * 4.0;
+  if (s < 1.0) return mix(c0, c1, s);
+  if (s < 2.0) return mix(c1, c2, s - 1.0);
+  if (s < 3.0) return mix(c2, c3, s - 2.0);
+  return mix(c3, c4, s - 3.0);
+}
+
+void main() {
+  vec3 base = textureLod(u_photo, v_uv, 0.0).rgb;
+  if (u_mode == 2) {
+    outColor = vec4(encode(base), 1.0);
+    return;
+  }
+
+  float z = textureLod(u_depth, v_uv, 0.0).r;
+  if (u_mode == 1) {
+    float lz = log(max(z, 1e-3));
+    float t = (lz - log(u_dnear)) / max(log(u_dfar) - log(u_dnear), 1e-4);
+    outColor = vec4(depthRamp(clamp(t, 0.0, 1.0)), 1.0);
+    return;
+  }
+
+  vec4 nearLayer = texture(u_near, v_uv);
+  vec4 farLayer = texture(u_far, v_uv);
+  float nearA = clamp(nearLayer.a, 0.0, 1.0);
+  float farA = clamp(farLayer.a, 0.0, 1.0);
+
+  vec3 under = farLayer.rgb + base * (1.0 - farA);
+  vec3 layered = nearLayer.rgb + under * (1.0 - nearA);
+
+  float radius = 0.5 * min(cocDiameter(z), u_maxblur);
+  float edgeCoverage = sin(PI * nearA);
+  float blend = max(smoothstep(0.55, 1.75, radius), 0.70 * edgeCoverage);
+  vec3 col = mix(base, layered, clamp(blend, 0.0, 1.0));
+  outColor = vec4(encode(col), 1.0);
+}`;
+
+  // Split the photo into premultiplied near/far layers. RGB is filtered as
+  // coverage-weighted colour and A is coverage. The second output is
+  // radius*coverage, which becomes the layer's CoC pyramid.
+  const LAYER_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_photo;
+uniform sampler2D u_depth;
+uniform float u_fpx;
+uniform float u_fmm;
+uniform float u_fstop;
+uniform float u_focus;
+uniform float u_scale;
+uniform float u_blur;
+uniform float u_highlight;
+uniform float u_maxblur;
+uniform float u_infoScale;
+uniform int u_layer;
+uniform int u_info;
+uniform int u_linear;
+
+float cocDiameter(float z) {
+  float zmm = clamp(z, 0.05, 4000.0) * 1000.0;
+  float smm = clamp(u_focus, 0.05, 4000.0) * 1000.0;
+  float c = (u_fpx / max(u_fstop, 0.7)) * u_fmm * abs(1.0 / zmm - 1.0 / smm);
+  return c * u_blur * u_scale;
+}
+
+vec3 hdrExpand(vec3 c, float spread) {
+  float m = max(c.r, max(c.g, c.b));
+  float t = smoothstep(0.6, 1.0, m);
+  float gain = 1.0 + float(u_linear) * u_highlight * 24.0 * t * t * spread;
+  return c * gain;
+}
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  float z = textureLod(u_depth, uv, 0.0).r;
+  float nearPart = 1.0 - step(u_focus, z);
+  float belongs = u_layer == 0 ? nearPart : 1.0 - nearPart;
+  float radius = 0.5 * min(cocDiameter(z), u_maxblur);
+
+  if (u_info == 1) {
+    outColor = vec4(radius * belongs / u_infoScale, 0.0, 0.0, 1.0);
+    return;
+  }
+
+  vec3 c = textureLod(u_photo, uv, 0.0).rgb;
+  c = hdrExpand(c, smoothstep(0.5, 6.0, radius));
+  outColor = vec4(c * belongs, belongs);
+}`;
+
+  // Blur one layer using its own CoC field. The mip probe pulls a filled
+  // radius and colour from coarser levels where the layer is occluded. The
+  // aperture is a fixed nine-blade polygon across the frame; the per-pixel
+  // phase changes sample placement, not the polygon's orientation.
+  const LAYER_BLUR_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_layerTex;
+uniform sampler2D u_infoTex;
+uniform sampler2D u_depth;
+uniform vec2 u_res;
+uniform float u_fpx;
+uniform float u_fmm;
+uniform float u_fstop;
+uniform float u_focus;
+uniform float u_scale;
+uniform float u_blur;
+uniform float u_maxblur;
+uniform float u_maxLod;
+uniform float u_infoScale;
+uniform int u_layer;
+uniform int u_taps;
+
+const int MAXTAPS = 40;
+const float GOLDEN = 2.399963229728653;
+const float PI = 3.14159265359;
+const float TAU = 6.28318530718;
+
+float cocDiameter(float z) {
+  float zmm = clamp(z, 0.05, 4000.0) * 1000.0;
+  float smm = clamp(u_focus, 0.05, 4000.0) * 1000.0;
+  float c = (u_fpx / max(u_fstop, 0.7)) * u_fmm * abs(1.0 / zmm - 1.0 / smm);
+  return c * u_blur * u_scale;
+}
+
+float ign(vec2 p) {
+  return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+float polygonLimit(float angle, float radius) {
+  const float blades = 9.0;
+  float sector = TAU / blades;
+  float local = mod(angle + 0.17 + sector * 0.5, sector) - sector * 0.5;
+  return radius * cos(PI / blades) / max(cos(local), 0.20);
+}
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  float z = textureLod(u_depth, uv, 0.0).r;
+  float nearPart = 1.0 - step(u_focus, z);
+  float belongs = u_layer == 0 ? nearPart : 1.0 - nearPart;
+  float radius = belongs > 0.5 ? 0.5 * min(cocDiameter(z), u_maxblur) : 0.0;
+
+  // The mip chain is the background fill. Walk coarser until this layer owns
+  // some coverage, then recover its coverage-weighted source CoC.
+  for (int probe = 0; probe < 12; probe++) {
+    float lod = min(float(probe), u_maxLod);
+    float coverage = textureLod(u_layerTex, uv, lod).a;
+    if (coverage > 0.02) {
+      float packedRadius = textureLod(u_infoTex, uv, lod).r * u_infoScale;
+      radius = max(radius, packedRadius / max(coverage, 1e-4));
+      break;
+    }
+    if (lod >= u_maxLod) break;
+  }
+
+  if (radius < 0.55) {
+    vec4 direct = textureLod(u_layerTex, uv, 0.0);
+    if (u_layer == 1) {
+      float coverage = smoothstep(0.0, 0.08, direct.a);
+      vec3 colour = direct.rgb / max(direct.a, 1e-4);
+      outColor = vec4(colour * coverage, coverage);
+    } else {
+      outColor = direct;
+    }
+    return;
+  }
+
+  // Cat's-eye clipping is strongest toward the corners and at wide apertures.
+  vec2 field = (uv - 0.5) * 2.0;
+  field.x *= u_res.x / max(u_res.y, 1.0);
+  float wide = 1.0 - smoothstep(1.6, 8.0, u_fstop);
+  float catEye = 1.0 - 0.16 * wide * smoothstep(0.2, 1.2, length(field));
+  radius *= catEye;
+
+  float spin = ign(gl_FragCoord.xy + vec2(float(u_layer) * 19.0, 0.0)) * TAU;
+  float lod = clamp(log2(max(1.0, radius * 0.45)), 0.0, u_maxLod);
+  vec4 sum = vec4(0.0);
+
+  for (int i = 0; i < MAXTAPS; i++) {
+    if (i >= u_taps) break;
+    float fi = float(i) + 0.5;
+    float angle = fi * GOLDEN + spin;
+    float limit = polygonLimit(angle, radius);
+    float r = sqrt(fi / float(u_taps)) * limit;
+    vec2 sampleUV = clamp(uv + vec2(cos(angle), sin(angle)) * r / u_res, vec2(0.0), vec2(1.0));
+    sum += textureLod(u_layerTex, sampleUV, lod);
+  }
+  sum /= float(u_taps);
+
+  if (u_layer == 1) {
+    float coverage = smoothstep(0.0, 0.08, sum.a);
+    vec3 colour = sum.rgb / max(sum.a, 1e-4);
+    outColor = vec4(colour * coverage, coverage);
+  } else {
+    outColor = sum;
+  }
 }`;
 
   /* -------------------------------------------------------------- webgl init */
@@ -229,6 +356,31 @@ void main() {
       throw new Error(gl.getShaderInfoLog(sh) || "shader compile failed");
     }
     return sh;
+  }
+
+  function makeProgram(gl, fragment, label) {
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, fragment));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(prog) || (label + " link failed"));
+    }
+    return prog;
+  }
+
+  function uniformLocations(gl, prog, names) {
+    const out = {};
+    for (const name of names) out[name] = gl.getUniformLocation(prog, name);
+    return out;
+  }
+
+  function glError(gl, label, fail = true) {
+    const code = gl.getError();
+    if (code === gl.NO_ERROR) return;
+    const msg = label + ": WebGL error 0x" + code.toString(16);
+    if (fail) throw new Error(msg);
+    console.error(msg);
   }
 
   function initGL() {
@@ -244,36 +396,31 @@ void main() {
     if (!gl) throw new Error("WebGL2 is not available in this browser.");
     S.gl = gl;
 
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT));
-    gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG));
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(prog) || "program link failed");
-    }
-    S.prog = prog;
-
-    const progPre = gl.createProgram();
-    gl.attachShader(progPre, compile(gl, gl.VERTEX_SHADER, VERT));
-    gl.attachShader(progPre, compile(gl, gl.FRAGMENT_SHADER, PRE_FRAG));
-    gl.linkProgram(progPre);
-    if (!gl.getProgramParameter(progPre, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(progPre) || "pre-pass link failed");
-    }
-    S.progPre = progPre;
-    S.locPre.u_src = gl.getUniformLocation(progPre, "u_src");
+    S.progFinal = makeProgram(gl, FINAL_FRAG, `final`);
+    S.progLayer = makeProgram(gl, LAYER_FRAG, `layer`);
+    S.progBlur = makeProgram(gl, LAYER_BLUR_FRAG, `layer blur`);
+    S.progPre = makeProgram(gl, PRE_FRAG, `pre-pass`);
+    S.locFinal = uniformLocations(gl, S.progFinal, [
+      `u_photo`, `u_depth`, `u_near`, `u_far`, `u_fpx`, `u_fmm`,
+      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxblur`,
+      `u_dnear`, `u_dfar`, `u_mode`, `u_linear`,
+    ]);
+    S.locLayer = uniformLocations(gl, S.progLayer, [
+      `u_photo`, `u_depth`, `u_fpx`, `u_fmm`, `u_fstop`, `u_focus`,
+      `u_scale`, `u_blur`, `u_highlight`, `u_maxblur`, `u_infoScale`,
+      `u_layer`, `u_info`, `u_linear`,
+    ]);
+    S.locBlur = uniformLocations(gl, S.progBlur, [
+      `u_layerTex`, `u_infoTex`, `u_depth`, `u_res`, `u_fpx`, `u_fmm`,
+      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxblur`,
+      `u_maxLod`, `u_infoScale`, `u_layer`, `u_taps`,
+    ]);
+    S.locPre.u_src = gl.getUniformLocation(S.progPre, "u_src");
     S.fbo = gl.createFramebuffer();
 
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    useQuad(prog);
-
-    for (const n of ["u_photo", "u_depth", "u_res", "u_tex", "u_fpx", "u_fmm", "u_fstop", "u_focus",
-      "u_scale", "u_blur", "u_highlight", "u_maxblur", "u_dnear", "u_dfar", "u_mode", "u_taps", "u_linear"]) {
-      S.loc[n] = gl.getUniformLocation(prog, n);
-    }
-
     for (const key of ["photo", "depth", "linear"]) {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
@@ -283,6 +430,19 @@ void main() {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       S.tex[key] = t;
     }
+
+    const dims = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+    S.maxExport = Math.max(1, Math.min(
+      gl.getParameter(gl.MAX_TEXTURE_SIZE),
+      gl.getParameter(gl.MAX_RENDERBUFFER_SIZE),
+      dims[0],
+      dims[1],
+    ));
+    S.colorFloat = !!(gl.getExtension("EXT_color_buffer_float") ||
+                      gl.getExtension("EXT_color_buffer_half_float"));
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    glError(gl, "WebGL initialisation");
   }
 
   // Attribute locations are per-program state, and the pre-pass program is a
@@ -302,10 +462,9 @@ void main() {
   // falls back to the raw photo texture with the legacy gamma behaviour.
   function buildLinearTexture(w, h) {
     const gl = S.gl;
-    const canFloat = !!(gl.getExtension("EXT_color_buffer_float") ||
-                        gl.getExtension("EXT_color_buffer_half_float"));
+    const canFloat = S.colorFloat;
     gl.bindTexture(gl.TEXTURE_2D, S.tex.linear);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -327,75 +486,309 @@ void main() {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (ok) {
+      gl.bindTexture(gl.TEXTURE_2D, S.tex.linear);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      glError(gl, "linear photo mip pyramid");
+    }
     S.linearOK = ok;
     return ok;
+  }
+
+  const halfFloatScratch = new Float32Array(1);
+  const halfBitsScratch = new Uint32Array(halfFloatScratch.buffer);
+
+  function floatToHalf(value) {
+    halfFloatScratch[0] = value;
+    const bits = halfBitsScratch[0];
+    const sign = (bits >>> 16) & 0x8000;
+    const exponent = (bits >>> 23) & 0xff;
+    let mantissa = bits & 0x7fffff;
+
+    if (exponent === 0xff) return sign | 0x7c00 | (mantissa ? 0x0200 : 0);
+    let halfExp = exponent - 127 + 15;
+    if (halfExp >= 0x1f) return sign | 0x7c00;
+    if (halfExp <= 0) {
+      if (halfExp < -10) return sign;
+      mantissa |= 0x800000;
+      const shift = 14 - halfExp;
+      let halfMant = mantissa >>> shift;
+      const remainder = mantissa & ((1 << shift) - 1);
+      const halfway = 1 << (shift - 1);
+      if (remainder > halfway || (remainder === halfway && (halfMant & 1))) halfMant++;
+      return sign | halfMant;
+    }
+
+    let halfMant = mantissa >>> 13;
+    const remainder = mantissa & 0x1fff;
+    if (remainder > 0x1000 || (remainder === 0x1000 && (halfMant & 1))) {
+      halfMant++;
+      if (halfMant === 0x400) {
+        halfMant = 0;
+        halfExp++;
+        if (halfExp >= 0x1f) return sign | 0x7c00;
+      }
+    }
+    return sign | (halfExp << 10) | halfMant;
+  }
+
+  function resizeDepthHalf(depthRaw, sourceW, sourceH, targetW, targetH) {
+    const expected = sourceW * sourceH * 2;
+    if (depthRaw.byteLength < expected) {
+      throw new Error("depth buffer is shorter than its metadata dimensions");
+    }
+    const source = new Uint16Array(depthRaw);
+    if (sourceW === targetW && sourceH === targetH) return source;
+
+    const out = new Uint16Array(targetW * targetH);
+    for (let y = 0; y < targetH; y++) {
+      const sy = Math.max(0, Math.min(sourceH - 1, (y + 0.5) * sourceH / targetH - 0.5));
+      const y0 = Math.floor(sy), y1 = Math.min(sourceH - 1, y0 + 1);
+      const fy = sy - y0;
+      for (let x = 0; x < targetW; x++) {
+        const sx = Math.max(0, Math.min(sourceW - 1, (x + 0.5) * sourceW / targetW - 0.5));
+        const x0 = Math.floor(sx), x1 = Math.min(sourceW - 1, x0 + 1);
+        const fx = sx - x0;
+        const d00 = halfToFloat(source[y0 * sourceW + x0]);
+        const d10 = halfToFloat(source[y0 * sourceW + x1]);
+        const d01 = halfToFloat(source[y1 * sourceW + x0]);
+        const d11 = halfToFloat(source[y1 * sourceW + x1]);
+        const top = d00 + (d10 - d00) * fx;
+        const bottom = d01 + (d11 - d01) * fx;
+        out[y * targetW + x] = floatToHalf(top + (bottom - top) * fy);
+      }
+    }
+    return out;
   }
 
   function uploadTextures(bitmap, depthRaw, meta) {
     const gl = S.gl;
     const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const k = Math.min(1, maxTex / Math.max(meta.width, meta.height));
+    const targetW = Math.max(1, Math.round(meta.width * k));
+    const targetH = Math.max(1, Math.round(meta.height * k));
 
     let bmp = bitmap;
-    if (meta.width > maxTex || meta.height > maxTex) {
-      const k = maxTex / Math.max(meta.width, meta.height);
+    if (bitmap.width !== targetW || bitmap.height !== targetH) {
       const c = document.createElement("canvas");
-      c.width = Math.round(meta.width * k);
-      c.height = Math.round(meta.height * k);
-      c.getContext("2d").drawImage(bitmap, 0, 0, c.width, c.height);
+      c.width = targetW;
+      c.height = targetH;
+      c.getContext("2d").drawImage(bitmap, 0, 0, targetW, targetH);
       bmp = c;
     }
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.photo);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    glError(gl, "photo upload");
 
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
-    const half = new Uint16Array(depthRaw);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, meta.width, meta.height, 0, gl.RED, gl.HALF_FLOAT, half);
+    const half = resizeDepthHalf(depthRaw, meta.width, meta.height, targetW, targetH);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, targetW, targetH, 0, gl.RED, gl.HALF_FLOAT, half);
+    glError(gl, "depth upload");
 
-    buildLinearTexture(bmp.width, bmp.height);
+    buildLinearTexture(targetW, targetH);
   }
 
   /* --------------------------------------------------------------- rendering */
 
-  function render(taps) {
-    const gl = S.gl, canvas = $("view");
-    if (!S.meta || !S.prog) return;
-    if (!canvas.width || !canvas.height) return;
+  function releaseTargets() {
+    if (!S.targets) return;
+    const gl = S.gl;
+    for (const key of ["nearColour", "farColour", "nearInfo", "farInfo", "nearBlur", "farBlur"]) {
+      if (S.targets[key]) gl.deleteTexture(S.targets[key]);
+    }
+    S.targets = null;
+  }
 
-    // The Original view bypasses the linear pipeline entirely, so the
-    // hold-Space comparison stays bit-exact in every configuration.
-    const effMode = S.holdOriginal ? 2 : S.mode;
-    const useLinear = S.linearOK && effMode !== 2;
+  function makeTargetTexture(internal, w, h, levels, mipmapped) {
+    const gl = S.gl;
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER,
+      mipmapped ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texStorage2D(gl.TEXTURE_2D, levels, internal, w, h);
+    return t;
+  }
 
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(S.prog);
-    useQuad(S.prog);
+  function attachTarget(texture) {
+    const gl = S.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, S.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error("WebGL framebuffer is incomplete for the bokeh layer");
+    }
+  }
+
+  function ensureTargets(outputW, outputH) {
+    const areaScale = Math.sqrt(MAX_WORK_PIXELS / (outputW * outputH));
+    const sideScale = MAX_WORK_SIDE / Math.max(outputW, outputH);
+    const scale = Math.min(1, areaScale, sideScale);
+    const w = Math.max(1, Math.round(outputW * scale));
+    const h = Math.max(1, Math.round(outputH * scale));
+    if (S.targets && S.targets.w === w && S.targets.h === h) return S.targets;
+
+    releaseTargets();
+    const gl = S.gl;
+    const levels = 1 + Math.floor(Math.log2(Math.max(w, h)));
+    const colourFormat = S.colorFloat ? gl.RGBA16F : gl.RGBA8;
+    const infoFormat = S.colorFloat ? gl.R16F : gl.R8;
+    const targets = {
+      w, h, levels,
+      maxLod: levels - 1,
+      infoScale: S.colorFloat ? 1 : Math.max(1, Math.min(w, h) * 0.20),
+      nearColour: makeTargetTexture(colourFormat, w, h, levels, true),
+      farColour: makeTargetTexture(colourFormat, w, h, levels, true),
+      nearInfo: makeTargetTexture(infoFormat, w, h, levels, true),
+      farInfo: makeTargetTexture(infoFormat, w, h, levels, true),
+      nearBlur: makeTargetTexture(colourFormat, w, h, 1, false),
+      farBlur: makeTargetTexture(colourFormat, w, h, 1, false),
+    };
+    S.targets = targets;
+    for (const key of ["nearColour", "farColour", "nearInfo", "farInfo", "nearBlur", "farBlur"]) {
+      attachTarget(targets[key]);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    glError(gl, "bokeh target allocation");
+    return targets;
+  }
+
+  function setLayerUniforms(loc, w, h, linear) {
+    const gl = S.gl, m = S.meta;
+    const fmm = effFocal();
+    gl.uniform1f(loc.u_fpx, (fmm * m.width) / 36);
+    gl.uniform1f(loc.u_fmm, fmm);
+    gl.uniform1f(loc.u_fstop, FSTOPS[S.fstopIdx]);
+    gl.uniform1f(loc.u_focus, S.focus);
+    gl.uniform1f(loc.u_scale, w / m.width);
+    gl.uniform1f(loc.u_blur, S.blur);
+    gl.uniform1f(loc.u_maxblur, Math.min(w, h) * 0.10);
+    gl.uniform1i(loc.u_linear, linear ? 1 : 0);
+  }
+
+  function prepareLayers(linear) {
+    const gl = S.gl, t = S.targets;
+    const source = linear ? S.tex.linear : S.tex.photo;
+    gl.useProgram(S.progLayer);
+    useQuad(S.progLayer);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, useLinear ? S.tex.linear : S.tex.photo);
-    gl.uniform1i(S.loc.u_photo, 0);
+    gl.bindTexture(gl.TEXTURE_2D, source);
+    gl.uniform1i(S.locLayer.u_photo, 0);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
-    gl.uniform1i(S.loc.u_depth, 1);
+    gl.uniform1i(S.locLayer.u_depth, 1);
+    setLayerUniforms(S.locLayer, t.w, t.h, linear);
+    gl.uniform1f(S.locLayer.u_highlight, S.highlight);
+    gl.uniform1f(S.locLayer.u_infoScale, t.infoScale);
 
-    const m = S.meta;
+    for (let layer = 0; layer < 2; layer++) {
+      const colour = layer === 0 ? t.nearColour : t.farColour;
+      const info = layer === 0 ? t.nearInfo : t.farInfo;
+      gl.uniform1i(S.locLayer.u_layer, layer);
+      gl.viewport(0, 0, t.w, t.h);
+
+      attachTarget(colour);
+      gl.uniform1i(S.locLayer.u_info, 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      attachTarget(info);
+      gl.uniform1i(S.locLayer.u_info, 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    for (const texture of [t.nearColour, t.farColour, t.nearInfo, t.farInfo]) {
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.generateMipmap(gl.TEXTURE_2D);
+    }
+    glError(gl, "layer pyramid");
+  }
+
+  function blurLayers(taps, linear) {
+    const gl = S.gl, t = S.targets;
+    gl.useProgram(S.progBlur);
+    useQuad(S.progBlur);
+    gl.uniform2f(S.locBlur.u_res, t.w, t.h);
+    gl.uniform1f(S.locBlur.u_maxLod, t.maxLod);
+    gl.uniform1f(S.locBlur.u_infoScale, t.infoScale);
+    gl.uniform1i(S.locBlur.u_taps, Math.max(8, Math.min(40, taps || PREVIEW_TAPS)));
+    setLayerUniforms(S.locBlur, t.w, t.h, linear);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
+    gl.uniform1i(S.locBlur.u_depth, 2);
+    gl.viewport(0, 0, t.w, t.h);
+
+    for (let layer = 0; layer < 2; layer++) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, layer === 0 ? t.nearColour : t.farColour);
+      gl.uniform1i(S.locBlur.u_layerTex, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, layer === 0 ? t.nearInfo : t.farInfo);
+      gl.uniform1i(S.locBlur.u_infoTex, 1);
+      gl.uniform1i(S.locBlur.u_layer, layer);
+      attachTarget(layer === 0 ? t.nearBlur : t.farBlur);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (S.busy) glError(gl, "layered bokeh", false);
+  }
+
+  function renderFinal(mode, useLinear) {
+    const gl = S.gl, canvas = $("view"), m = S.meta;
+    const t = S.targets;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(S.progFinal);
+    useQuad(S.progFinal);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, useLinear ? S.tex.linear : S.tex.photo);
+    gl.uniform1i(S.locFinal.u_photo, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
+    gl.uniform1i(S.locFinal.u_depth, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, mode === 0 && t ? t.nearBlur : S.tex.depth);
+    gl.uniform1i(S.locFinal.u_near, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, mode === 0 && t ? t.farBlur : S.tex.depth);
+    gl.uniform1i(S.locFinal.u_far, 3);
+
     const fmm = effFocal();
-    gl.uniform2f(S.loc.u_res, canvas.width, canvas.height);
-    gl.uniform2f(S.loc.u_tex, m.width, m.height);
-    gl.uniform1f(S.loc.u_fpx, (fmm * m.width) / 36);
-    gl.uniform1f(S.loc.u_fmm, fmm);
-    gl.uniform1f(S.loc.u_fstop, FSTOPS[S.fstopIdx]);
-    gl.uniform1f(S.loc.u_focus, S.focus);
-    gl.uniform1f(S.loc.u_scale, canvas.width / m.width);
-    gl.uniform1f(S.loc.u_blur, S.blur);
-    gl.uniform1f(S.loc.u_highlight, S.highlight);
-    gl.uniform1f(S.loc.u_maxblur, Math.min(canvas.width, canvas.height) * 0.10);
-    gl.uniform1f(S.loc.u_dnear, S.dLo);
-    gl.uniform1f(S.loc.u_dfar, S.dHi);
-    gl.uniform1i(S.loc.u_mode, effMode);
-    gl.uniform1i(S.loc.u_taps, taps || 96);
-    gl.uniform1i(S.loc.u_linear, useLinear ? 1 : 0);
-
+    gl.uniform1f(S.locFinal.u_fpx, (fmm * m.width) / 36);
+    gl.uniform1f(S.locFinal.u_fmm, fmm);
+    gl.uniform1f(S.locFinal.u_fstop, FSTOPS[S.fstopIdx]);
+    gl.uniform1f(S.locFinal.u_focus, S.focus);
+    gl.uniform1f(S.locFinal.u_scale, canvas.width / m.width);
+    gl.uniform1f(S.locFinal.u_blur, S.blur);
+    gl.uniform1f(S.locFinal.u_maxblur, Math.min(canvas.width, canvas.height) * 0.10);
+    gl.uniform1f(S.locFinal.u_dnear, S.dLo);
+    gl.uniform1f(S.locFinal.u_dfar, S.dHi);
+    gl.uniform1i(S.locFinal.u_mode, mode);
+    gl.uniform1i(S.locFinal.u_linear, useLinear ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (S.busy) glError(gl, "final render", false);
+  }
+
+  function render(taps) {
+    const gl = S.gl, canvas = $("view");
+    if (!S.meta || !S.progFinal) return;
+    if (!canvas.width || !canvas.height || gl.isContextLost()) return;
+
+    const effMode = S.holdOriginal ? 2 : S.mode;
+    const useLinear = S.linearOK && effMode !== 2;
+    if (effMode === 0) {
+      ensureTargets(canvas.width, canvas.height);
+      prepareLayers(useLinear);
+      blurLayers(taps, useLinear);
+    }
+    renderFinal(effMode, useLinear);
   }
 
   function requestRender() {
@@ -403,7 +796,7 @@ void main() {
     S.dirty = true;
     requestAnimationFrame(() => {
       S.dirty = false;
-      render(96);
+      render(PREVIEW_TAPS);
     });
   }
 
@@ -663,11 +1056,11 @@ void main() {
   async function exportRender({ mode, mime, ext, taps }) {
     const canvas = $("view");
     const meta = S.meta;
-    const k = Math.min(1, MAX_EXPORT / Math.max(meta.width, meta.height));
+    const k = Math.min(1, S.maxExport / Math.max(meta.width, meta.height));
     const w = Math.round(meta.width * k);
     const h = Math.round(meta.height * k);
 
-    overlay(true, "Rendering", `${w} × ${h} px · ${taps} taps per pixel`, 35);
+    overlay(true, "Rendering", `${w} × ${h} px · layered mip bokeh · ${taps} aperture taps`, 35);
     await sleep(60);
 
     const prevW = canvas.width, prevH = canvas.height;
@@ -698,7 +1091,7 @@ void main() {
         mode: 0,
         mime: S.format === "png" ? "image/png" : "image/jpeg",
         ext: `${S.format === "png" ? "png" : "jpg"}`,
-        taps: 192,
+        taps: EXPORT_TAPS,
       });
     } catch (e) {
       console.error(e);

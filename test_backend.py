@@ -7,6 +7,29 @@ import numpy as np
 
 import app as studio
 
+
+def check_equal_luminance_guide() -> None:
+    """The guide must see a red/green boundary even when luma is identical."""
+    h, w = 96, 128
+    image = np.zeros((h, w, 3), dtype=np.uint8)
+    image[:, : w // 2] = (255, 0, 0)
+    image[:, w // 2 :] = (0, 76, 0)  # approximately the same luma as pure red
+    coarse = np.full((12, 16), 0.2, dtype=np.float32)
+    coarse[:, 8:] = 0.8
+
+    refined = studio.guided_upsample(coarse, image)
+    bilinear = studio.F.interpolate(
+        studio.torch.from_numpy(coarse)[None, None], size=(h, w), mode="bilinear", align_corners=False
+    )[0, 0].numpy()
+    edge = slice(w // 2 - 15, w // 2 + 15)
+    guided_gradient = np.abs(np.diff(refined[:, edge], axis=1)).max()
+    bilinear_gradient = np.abs(np.diff(bilinear[:, edge], axis=1)).max()
+    print(f"colour guide edge: guided={guided_gradient:.3f} bilinear={bilinear_gradient:.3f}")
+    assert guided_gradient > bilinear_gradient * 2, "colour guide did not recover the chroma-only edge"
+
+
+check_equal_luminance_guide()
+
 path = Path(sys.argv[1]) if len(sys.argv) > 1 else studio.ROOT / "static/sample.jpg"
 t0 = time.time()
 studio.load_model()

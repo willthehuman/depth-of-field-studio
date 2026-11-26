@@ -123,10 +123,13 @@ def _box(x: torch.Tensor, r: int) -> torch.Tensor:
     if r <= 0:
         return x
     k = 2 * r + 1
+    channels = x.shape[1]
     x = F.pad(x, (r, r, 0, 0), mode="replicate")
-    x = F.conv2d(x, torch.full((1, 1, 1, k), 1.0 / k))
+    kernel_x = torch.full((channels, 1, 1, k), 1.0 / k, dtype=x.dtype, device=x.device)
+    x = F.conv2d(x, kernel_x, groups=channels)
     x = F.pad(x, (0, 0, r, r), mode="replicate")
-    x = F.conv2d(x, torch.full((1, 1, k, 1), 1.0 / k))
+    kernel_y = torch.full((channels, 1, k, 1), 1.0 / k, dtype=x.dtype, device=x.device)
+    x = F.conv2d(x, kernel_y, groups=channels)
     return x
 
 
@@ -135,27 +138,40 @@ def guided_upsample(inverse_depth: np.ndarray, image: np.ndarray, radius: int = 
 
     A plain bilinear upsample of a 1536-wide depth map melts every silhouette
     over ~4 px of the full frame, which shows up as a soft in-focus rim next to a
-    heavily blurred background. A guided filter (He et al.) driven by the photo's
-    own luminance carries the depth edges back onto the real edges.
+    heavily blurred background. This is the guided filter from He et al., applied
+    to each colour channel and fused by local contrast. A luminance-only guide
+    misses edges between colours of equal luminance (for example red against
+    green); the colour channels keep those boundaries available to the depth map.
     """
     h, w = image.shape[:2]
     p = torch.from_numpy(np.ascontiguousarray(inverse_depth, dtype=np.float32))[None, None]
     if p.shape[-2:] != (h, w):
         p = F.interpolate(p, size=(h, w), mode="bilinear", align_corners=False)
-    guide = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1)
-    guide = guide.to(torch.float32).mean(0, keepdim=True).div_(255.0)
+    guide = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
+    guide = guide.to(torch.float32).div_(255.0)
 
     eps = 2e-4
-    mean_i = _box(guide, radius)
     mean_p = _box(p, radius)
-    corr_i = _box(guide * guide, radius)
-    corr_ip = _box(guide * p, radius)
-    var_i = corr_i - mean_i * mean_i
-    cov_ip = corr_ip - mean_i * mean_p
-    a = cov_ip / (var_i + eps)
-    b = mean_p - a * mean_i
-    q = _box(a, radius) * guide + _box(b, radius)
-    return q[0, 0].numpy()
+    merged = torch.zeros_like(p)
+    total_weight = torch.zeros_like(p)
+
+    # Fuse the channels by local structural contrast. A channel with a real edge
+    # gets more say than one that is flat across the same window.
+    for channel in range(3):
+        guide_c = guide[:, channel : channel + 1]
+        mean_i = _box(guide_c, radius)
+        corr_i = _box(guide_c * guide_c, radius)
+        corr_ip = _box(guide_c * p, radius)
+        var_i = corr_i - mean_i * mean_i
+        cov_ip = corr_ip - mean_i * mean_p
+        a = cov_ip / (var_i + eps)
+        b = mean_p - a * mean_i
+        q = _box(a, radius) * guide_c + _box(b, radius)
+        channel_weight = _box(var_i, radius) + eps
+        merged.add_(q * channel_weight)
+        total_weight.add_(channel_weight)
+
+    return (merged / total_weight)[0, 0].numpy()
 
 
 # ------------------------------------------------------------------------ inference
