@@ -1,0 +1,12 @@
+venv/
+torch_cache/
+data/
+repo/
+static/big.jpg
+test_big.jpg
+__pycache__/
+*.pyc
+docs_preview_*.jpg
+docs_preview_*.png
+docs_shot_*.png
+probe_depth.*

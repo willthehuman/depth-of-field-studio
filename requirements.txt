@@ -1,0 +1,11 @@
+# Windows install used by this app (Python 3.13 venv).
+# torch/torchvision must come from the CUDA index; plain PyPI wheels are CPU-only.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# then, once, for the model package itself:
+#   venv\Scripts\python.exe -m pip install -e repo
