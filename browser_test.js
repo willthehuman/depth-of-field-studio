@@ -98,24 +98,25 @@
   out.depthBottomPixel = at(0.5, 0.95);
   if (out.depthTopWarmth > out.depthBottomWarmth) fail.push("depth looks vertically flipped (sky warmer/nearer than the ground)");
 
-  // ------------------------------------- 3. build a depth-bin map from the turbo map
-  const turbo = (t) => {
-    const kr4 = [0.13572138, 4.6153926, -42.66032258, 132.13108234];
-    const kr2 = [-152.94239396, 59.28637943];
-    const kg4 = [0.09140261, 2.19418839, 4.84296658, -14.18503333];
-    const kg2 = [4.27729857, 2.82956604];
-    const kb4 = [0.1066733, 12.64194608, -60.58204836, 110.36276771];
-    const kb2 = [-89.90310912, 27.34824973];
-    const t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
-    const v4 = [1, t, t2, t3], v2 = [t4, t5];
-    const dot = (a, b) => a.reduce((s, x, i) => s + x * b[i], 0);
-    return [
-      Math.min(255, Math.max(0, 255 * (dot(v4, kr4) + dot(v2, kr2)))),
-      Math.min(255, Math.max(0, 255 * (dot(v4, kg4) + dot(v2, kg2)))),
-      Math.min(255, Math.max(0, 255 * (dot(v4, kb4) + dot(v2, kb2)))),
-    ];
+  // ------------------------------------- 3. build a depth-bin map from the depthRamp
+  // Must mirror FINAL_FRAG's depthRamp (5 stops), not Google's turbo: the LUT
+  // is used to classify pixels into depth bands, so a stale colormap silently
+  // puts pixels in the wrong band.
+  const depthRamp = (t) => {
+    const c0 = [1.00, 0.30, 0.16], c1 = [1.00, 0.70, 0.20], c2 = [0.98, 0.95, 0.62],
+          c3 = [0.36, 0.86, 0.86], c4 = [0.24, 0.45, 0.95];
+    t = Math.min(1, Math.max(0, t));
+    const s = t * 4;
+    const mix = (a, b, f) => a.map((v, i) => v + (b[i] - v) * f);
+    let rgb;
+    if (s < 1) rgb = mix(c0, c1, s);
+    else if (s < 2) rgb = mix(c1, c2, s - 1);
+    else if (s < 3) rgb = mix(c2, c3, s - 2);
+    else rgb = mix(c3, c4, s - 3);
+    return rgb.map((v) => Math.round(v * 255));
   };
-  const LUT = Array.from({ length: 128 }, (_, i) => turbo(i / 127));
+  // Shader t: 0 = near (warm) .. 1 = far (cool). The test wants 1 = near.
+  const LUT = Array.from({ length: 128 }, (_, i) => depthRamp(1 - i / 127));
 
   const QW = Math.round(W / 4), QH = Math.round(H / 4);
   const tq = new Float32Array(QW * QH);
@@ -244,6 +245,30 @@
     fail.push("could not find a mid-depth point to refocus on");
   }
 
+  // --- lens scaling must be linear in focal length, not quadratic ---
+  const setLens = (mm) => {
+    const b = document.querySelector(`#lens button[data-mm="${mm}"]`);
+    if (b) b.click();
+  };
+  setFstop(6); // f/2.0
+  setBlur(100);
+  setLens(0);  // Native
+  await frame();
+  const natLum = lum(cap());
+  setLens(85);
+  await frame();
+  const simLum = lum(cap());
+  // far band sharpness ratio native->85mm. Quadratic bug gave ~8x more blur;
+  // linear optics give a bounded increase. Assert far band gets blurrier but
+  // not catastrophically (ratio of sharpness stays > 0.05).
+  const farNat = sharpness(natLum, bands - 1);
+  const farSim = sharpness(simLum, bands - 1);
+  out.lensScaling = { farNat: +farNat.toFixed(3), farSim: +farSim.toFixed(3) };
+  if (farNat > 0.2 && farSim / farNat < 0.02) {
+    fail.push("85mm sim over-blurs (quadratic regression): " + (farSim / farNat).toFixed(4));
+  }
+  setLens(0);
+
   // -------------------------------------------------------------- 4. export path
   const exports = [];
   const origCreate = URL.createObjectURL;
@@ -262,6 +287,22 @@
     if (bmp.width < 1000 || bmp.height < 700) fail.push(`export is not full resolution (${bmp.width}x${bmp.height})`);
   } else {
     fail.push("export produced no blob");
+  }
+
+  // export filename must carry a real extension
+  const names = [];
+  // capture the download name by wrapping HTMLAnchorElement.click
+  const origClick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function () {
+    if (this.download) names.push(this.download);
+    return origClick.apply(this, arguments);
+  };
+  $("exportBtn").click();
+  for (let i = 0; i < 300 && names.length === 0; i++) await sleep(200);
+  HTMLAnchorElement.prototype.click = origClick;
+  out.exportName = names[0] || null;
+  if (!out.exportName || !/\.(jpg|png)$/.test(out.exportName)) {
+    fail.push("export filename lacks a proper extension: " + out.exportName);
   }
 
   out.failures = fail;

@@ -17,10 +17,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
 import traceback
+import uuid
 from functools import partial
 from pathlib import Path
 
@@ -77,8 +79,6 @@ def load_model() -> None:
     with MODEL_LOCK:
         if STATE["model"] is not None:
             return
-        if STATE["status"] == "error":
-            return
         STATE.update(status="loading", message="Downloading / loading Depth Pro 2 H+ …")
         t0 = time.time()
         try:
@@ -111,7 +111,7 @@ def load_model() -> None:
                 error=None,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced in the UI
-            STATE.update(status="error", message=str(exc), error=traceback.format_exc())
+            STATE.update(status="idle", message=str(exc), error=traceback.format_exc())
             print(traceback.format_exc())
 
 
@@ -133,7 +133,8 @@ def _box(x: torch.Tensor, r: int) -> torch.Tensor:
     return x
 
 
-def guided_upsample(inverse_depth: np.ndarray, image: np.ndarray, radius: int = 8) -> np.ndarray:
+def guided_upsample(inverse_depth: np.ndarray, image: np.ndarray,
+                    radius: int = 8, device: str = "cpu") -> np.ndarray:
     """Upsample inverse depth to the photo's resolution, snapped to its edges.
 
     A plain bilinear upsample of a 1536-wide depth map melts every silhouette
@@ -144,11 +145,12 @@ def guided_upsample(inverse_depth: np.ndarray, image: np.ndarray, radius: int = 
     green); the colour channels keep those boundaries available to the depth map.
     """
     h, w = image.shape[:2]
-    p = torch.from_numpy(np.ascontiguousarray(inverse_depth, dtype=np.float32))[None, None]
+    dev = torch.device(device)
+    p = torch.from_numpy(np.ascontiguousarray(inverse_depth, dtype=np.float32))[None, None].to(dev)
     if p.shape[-2:] != (h, w):
         p = F.interpolate(p, size=(h, w), mode="bilinear", align_corners=False)
     guide = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).unsqueeze(0)
-    guide = guide.to(torch.float32).div_(255.0)
+    guide = guide.to(dev).to(torch.float32).div_(255.0)
 
     eps = 2e-4
     mean_p = _box(p, radius)
@@ -171,7 +173,47 @@ def guided_upsample(inverse_depth: np.ndarray, image: np.ndarray, radius: int = 
         merged.add_(q * channel_weight)
         total_weight.add_(channel_weight)
 
-    return (merged / total_weight)[0, 0].numpy()
+    return (merged / total_weight)[0, 0].float().cpu().numpy()
+
+
+def upsample_radius(h: int, w: int, ih: int, iw: int) -> int:
+    """Guided-filter radius, in full-res pixels, from the upsample factor.
+
+    The network's own depth edges are already sharp (a plain bilinear upsample
+    keeps them at ~2 px); the guided filter is only there to joint the depth to
+    the photo's edges. Every extra pixel of radius widens each depth edge by
+    ~2 px, which is what read as a halo in the depth map. Keep the window just
+    above one coarse pixel: factor 1.5 -> r1, a 27 MP upsample (factor ~4.7)
+    -> r4.
+    """
+    factor = max(h / max(ih, 1), w / max(iw, 1))
+    return int(min(8, max(1, round(0.75 * factor))))
+
+
+#: Full-frame sensor diagonal in mm (36 x 24). Using the diagonal makes the
+#: 35mm-equivalent invariant to portrait/landscape rotation and aspect ratio.
+FF_DIAGONAL_MM = float(np.hypot(36.0, 24.0))  # 43.2666...
+
+
+def focal35_from_fpx(f_px: float, width: int, height: int) -> float:
+    """35mm-equivalent focal length from focal-in-pixels, using the diagonal."""
+    return float(f_px * FF_DIAGONAL_MM / np.hypot(width, height))
+
+
+def disparity_to_metres(inv: np.ndarray, cap: float = 2000.0) -> np.ndarray:
+    """Convert inverse depth (1/m) to metres for UI/stats; sky (0) -> cap."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = 1.0 / np.maximum(inv, 1e-6)
+    return np.minimum(z, cap).astype(np.float32)
+
+
+def true_disparity(normalized: np.ndarray, width: int, f_px: float) -> np.ndarray:
+    """Convert the network's focal/width-normalized inverse depth to true 1/z (1/m).
+
+    The network predicts inverse depth scaled by f_px/width; the shaders (and
+    the physics) need metres^-1, where CoC is exactly linear in |1/z - 1/s|.
+    """
+    return np.maximum(normalized, 0.0).astype(np.float32) * (width / max(f_px, 1e-6))
 
 
 # ------------------------------------------------------------------------ inference
@@ -221,20 +263,31 @@ def estimate(image_path: Path, side: int) -> dict:
         inv_small = np.nan_to_num(f_px_small / (iw * depth_small), nan=0.0, posinf=0.0)
 
     t1 = time.time()
-    inv_full = guided_upsample(inv_small, image)
+    radius = upsample_radius(h, w, ih, iw)
+    try:
+        inv_full = guided_upsample(inv_small, image, radius=radius,
+                                   device=STATE["device"] or "cpu")
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print("[depth] guided upsample did not fit on GPU, falling back to CPU")
+        inv_full = guided_upsample(inv_small, image, radius=radius, device="cpu")
     refine_seconds = time.time() - t1
+    # The network's inverse depth is normalized by focal length and width
+    # (inv = f_px/width * 1/z). Divide that scale out so the texture and the
+    # shaders hold true inverse depth in 1/m, where CoC is exactly linear.
+    inv_full = true_disparity(inv_full, iw, f_px_small)
 
-    depth_full = f_px_full / (w * np.maximum(inv_full, 1e-6))
-    depth_full = np.minimum(depth_full, 2000.0).astype(np.float32)
+    # Metres are only for the UI range/percentiles; the stored texture is 1/z.
+    depth_full = disparity_to_metres(inv_full)
 
     sample = depth_full[:: max(1, h // 400), :: max(1, w // 400)]
     pct = np.percentile(sample, [0.5, 5, 50, 95, 99.5])
-    # f_px_full = f_mm * w / 36  ->  f_mm (35 mm equivalent) = f_px_full * 36 / w
-    focal35 = 36.0 * f_px_full / w
+    focal35 = focal35_from_fpx(f_px_full, w, h)
 
     return {
         "image": image,
-        "depth": depth_full,
+        "depth": inv_full,
+        "depth_encoding": "disparity_m",
         "width": w,
         "height": h,
         "f_px": float(f_px_full),
@@ -267,6 +320,16 @@ def job_paths(job_id: str) -> tuple[Path, Path, Path]:
     return d / "photo.png", d / "depth.f16", d / "meta.json"
 
 
+JOB_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def job_dir(job_id: str) -> Path | None:
+    """Return the job directory only for a well-formed id (blocks traversal)."""
+    if not JOB_RE.fullmatch(job_id):
+        return None
+    return DATA / job_id
+
+
 def prune_cache(keep: int = 8) -> None:
     jobs = sorted(
         (p for p in DATA.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True
@@ -276,20 +339,23 @@ def prune_cache(keep: int = 8) -> None:
 
 
 def analyze_bytes(raw: bytes, filename: str) -> dict:
-    job_id = hashlib.sha1(raw).hexdigest()[:16]
+    job_id = hashlib.sha1(raw + b"|v5-guided").hexdigest()[:16]
     photo, depth_file, meta_file = job_paths(job_id)
-    if meta_file.exists() and job_id in CACHE:
-        return CACHE[job_id]
+    with GLOBAL_LOCK:
+        if meta_file.exists() and photo.exists() and depth_file.exists():
+            if job_id not in CACHE:
+                CACHE[job_id] = json.loads(meta_file.read_text())
+            os.utime(photo.parent, None)  # refresh mtime so prune keeps hot jobs
+            return CACHE[job_id]
 
-    load_model()
-    if STATE["status"] != "ready":
-        raise RuntimeError(STATE["message"])
+        load_model()
+        if STATE["status"] != "ready":
+            raise RuntimeError(STATE["message"])
 
-    photo.parent.mkdir(parents=True, exist_ok=True)
-    tmp = photo.parent / f"upload_{job_id}"
-    tmp.write_bytes(raw)
-    try:
-        with GLOBAL_LOCK:
+        photo.parent.mkdir(parents=True, exist_ok=True)
+        tmp = photo.parent / f"upload_{job_id}_{uuid.uuid4().hex}"
+        tmp.write_bytes(raw)
+        try:
             t0 = time.time()
             result = estimate(tmp, DEFAULT_SIDE)
             total = time.time() - t0
@@ -307,8 +373,8 @@ def analyze_bytes(raw: bytes, filename: str) -> dict:
             CACHE[job_id] = meta
             prune_cache()
             return meta
-    finally:
-        tmp.unlink(missing_ok=True)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 # ----------------------------------------------------------------------------- app
@@ -349,16 +415,18 @@ def analyze(file: UploadFile = File(...)):
 
 @app.get("/api/jobs/{job_id}/image")
 def job_image(job_id: str):
-    path = DATA / job_id / "photo.png"
-    if not path.exists():
+    d = job_dir(job_id)
+    path = d / "photo.png" if d else None
+    if not path or not path.exists():
         return JSONResponse({"error": "unknown job"}, status_code=404)
     return FileResponse(path, media_type="image/png")
 
 
 @app.get("/api/jobs/{job_id}/depth")
 def job_depth(job_id: str):
-    path = DATA / job_id / "depth.f16"
-    if not path.exists():
+    d = job_dir(job_id)
+    path = d / "depth.f16" if d else None
+    if not path or not path.exists():
         return JSONResponse({"error": "unknown job"}, status_code=404)
     return Response(
         path.read_bytes(),
@@ -369,8 +437,9 @@ def job_depth(job_id: str):
 
 @app.get("/api/jobs/{job_id}/meta")
 def job_meta(job_id: str):
-    path = DATA / job_id / "meta.json"
-    if not path.exists():
+    d = job_dir(job_id)
+    path = d / "meta.json" if d else None
+    if not path or not path.exists():
         return JSONResponse({"error": "unknown job"}, status_code=404)
     return json.loads(path.read_text())
 

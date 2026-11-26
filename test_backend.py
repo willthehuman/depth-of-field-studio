@@ -47,18 +47,21 @@ print("  depth_pcts:", {k: round(v, 3) for k, v in meta["depth_pcts"].items()})
 
 d = np.fromfile(studio.DATA / meta["id"] / "depth.f16", dtype=np.float16).astype(np.float32)
 d = d.reshape(meta["height"], meta["width"])
-print(f"depth array {d.shape} min={d.min():.3f} max={d.max():.3f} median={np.median(d):.3f}")
+print(f"disparity array {d.shape} min={d.min():.5f} max={d.max():.5f} median={np.median(d):.5f}")
 
-# Physically sane: metres, positive, and a spread rather than a constant.
-assert np.isfinite(d).all(), "non-finite depth survived"
-assert d.min() > 0.02, "depth below 2 cm"
-assert np.median(d) < 900, "median depth implausible"
-assert float(d.std()) > 0.5, "depth is flat — the model probably did not run"
+# Physically sane inverse depth: non-negative, sky present (==0), real spread.
+assert np.isfinite(d).all(), "non-finite disparity survived"
+assert d.min() >= 0.0, "negative inverse depth"
+assert (d == 0.0).mean() > 0.01, "expected some sky at exactly 0"
+z = 1.0 / np.maximum(d, 1e-6)
+assert np.median(z[d > 0]) < 900, "median depth implausible"
+assert float(d.std()) > 1e-4, "disparity is flat — the model probably did not run"
 
 # The guided upsample must not invent structure: the coarse view should still
 # look like the same scene, just at the photo's scale.
 h, w = d.shape
 step = max(1, h // 240)
-coarse = d[::step, ::step]
+coarse = z[::step, ::step]
+coarse = coarse[coarse < 500]  # drop the sky cap so the stats mean something
 print(f"coarse {coarse.shape} median {np.median(coarse):.2f} m std {coarse.std():.2f}")
 print("OK")
