@@ -91,7 +91,9 @@ data/<id>/          cached photo.png + depth.f16 + meta.json (last 8 photos)
 
 ## Licence
 
-The **code** here is MIT — see [LICENSE](LICENSE).
+The **code** here is MIT — see [LICENSE](LICENSE). Apple's material (the model
+weights, the `ml-depth-pro-2` package and the sample photo) is **not** MIT and
+stays research-only — see [NOTICE.md](NOTICE.md).
 
 This repository is not a redistribution of Depth Pro 2, and the MIT licence does
 not extend to Apple's material:
