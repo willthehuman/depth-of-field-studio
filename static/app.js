@@ -1,6 +1,10 @@
 /* Depth of Field Studio — client.
    Depth is estimated once on the server; focus and aperture are a WebGL
-   gather-bokeh shader, so the sliders are instant and the export is full-res. */
+   gather-bokeh shader, so the sliders are instant and the export is full-res.
+   The gather runs in linear light: the photo is decoded from sRGB into a
+   half-float texture first (see buildLinearTexture), near-clipped highlights
+   are expanded back above 1.0 so bokeh discs carry real energy, and the
+   result is encoded back to sRGB on the way out. */
 (() => {
   "use strict";
 
@@ -30,7 +34,11 @@
     lowH: 0,
     gl: null,
     prog: null,
-    tex: { photo: null, depth: null },
+    progPre: null,
+    locPre: {},
+    fbo: null,
+    linearOK: false,
+    tex: { photo: null, depth: null, linear: null },
     loc: {},
     dirty: false,
     busy: false,
@@ -53,7 +61,7 @@ precision highp sampler2D;
 in vec2 v_uv;
 out vec4 outColor;
 
-uniform sampler2D u_photo;
+uniform sampler2D u_photo;  // linear-light copy of the photo (see PRE_FRAG)
 uniform sampler2D u_depth;
 uniform vec2  u_res;        // drawing buffer, px
 uniform vec2  u_tex;        // photo, px
@@ -69,9 +77,41 @@ uniform float u_dnear;
 uniform float u_dfar;
 uniform int   u_mode;       // 0 dof, 1 depth, 2 original
 uniform int   u_taps;
+uniform int   u_linear;     // 1 when u_photo is the linear-light texture
 
 const int MAXTAPS = 192;
 const float GOLDEN = 2.399963229728653;
+
+// The gather accumulates in linear light; the canvas expects sRGB, so the
+// result is encoded once, here, at the very end. When the linear pipeline is
+// unavailable (u_linear == 0) u_photo holds the raw sRGB photo and encoding
+// is skipped: the legacy gamma-space render, minus highlight emphasis,
+// which only exists in the linear pipeline.
+vec3 linearToSrgb(vec3 c) {
+  c = max(c, vec3(0.0));
+  vec3 lo = c * 12.92;
+  vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+  return mix(lo, hi, step(vec3(0.0031308), c));
+}
+
+vec3 encode(vec3 c) {
+  return u_linear == 1 ? linearToSrgb(c) : c;
+}
+
+// Pseudo-HDR reconstruction. A sample clipped at 1.0 in the source photo was
+// "1.0 or more" at the sensor; expanding near-clipped samples smoothly back
+// above 1.0 gives the gather real energy to spread, so a specular point
+// renders as a glowing disc instead of a grey smear. The spread argument
+// scales the gain by how far the sample's own light travels (its blur radius): an in-focus highlight does
+// not expand, so the focus boundary stays clean. u_highlight == 0 is exactly
+// neutral, and the gain multiplies the sample *value* — never its weight —
+// so colour balance is preserved.
+vec3 hdrExpand(vec3 c, float spread) {
+  float m = max(c.r, max(c.g, c.b));
+  float t = smoothstep(0.6, 1.0, m);
+  float gain = 1.0 + float(u_linear) * u_highlight * 24.0 * t * t * spread;
+  return c * gain;
+}
 
 float cocDiameter(float z) {
   // Thin-lens circle of confusion, expressed in photo pixels.
@@ -103,7 +143,7 @@ float ign(vec2 p) {
 void main() {
   vec3 base = texture(u_photo, v_uv).rgb;
 
-  if (u_mode == 2) { outColor = vec4(base, 1.0); return; }
+  if (u_mode == 2) { outColor = vec4(encode(base), 1.0); return; }
 
   float z = texture(u_depth, v_uv).r;
 
@@ -116,7 +156,7 @@ void main() {
 
   float coc = min(cocDiameter(z), u_maxblur);
   float radius = 0.5 * coc;
-  if (radius < 0.55) { outColor = vec4(base, 1.0); return; }
+  if (radius < 0.55) { outColor = vec4(encode(base), 1.0); return; }
 
   float spin = ign(gl_FragCoord.xy) * 6.2831853;
   vec3 sum = base;
@@ -139,15 +179,39 @@ void main() {
     float srad = 0.5 * min(cocDiameter(sz), u_maxblur);
     float w = smoothstep(r - 1.5, r + 1.5, srad);
 
-    // Optional emphasis on specular highlights, the way a fast lens renders them.
-    w *= 1.0 + u_highlight * smoothstep(0.70, 1.0, max(sc.r, max(sc.g, sc.b)));
+    // Specular energy: near-clipped samples carry reconstructed HDR energy,
+    // scaled by how far their own light actually spreads.
+    float spread = smoothstep(0.5, 6.0, srad);
+    sc = hdrExpand(sc, spread);
 
     sum += sc * w;
     wsum += w;
   }
 
   vec3 col = sum / wsum;
-  outColor = vec4(col, 1.0);
+  outColor = vec4(encode(col), 1.0);
+}`;
+
+  // Pre-pass: decode the sRGB photo into a linear-light texture, once per
+  // photo. Doing the decode here — instead of per tap in the gather — keeps
+  // the 192-tap loop free of pow() calls, and the half-float target holds
+  // the reconstructed highlight energy without clipping.
+  const PRE_FRAG = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_src;
+
+vec3 srgbToLinear(vec3 c) {
+  vec3 lo = c / 12.92;
+  vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+  return mix(lo, hi, step(vec3(0.04045), c));
+}
+
+void main() {
+  outColor = vec4(srgbToLinear(texture(u_src, v_uv).rgb), 1.0);
 }`;
 
   /* -------------------------------------------------------------- webgl init */
@@ -184,19 +248,28 @@ void main() {
     }
     S.prog = prog;
 
+    const progPre = gl.createProgram();
+    gl.attachShader(progPre, compile(gl, gl.VERTEX_SHADER, VERT));
+    gl.attachShader(progPre, compile(gl, gl.FRAGMENT_SHADER, PRE_FRAG));
+    gl.linkProgram(progPre);
+    if (!gl.getProgramParameter(progPre, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(progPre) || "pre-pass link failed");
+    }
+    S.progPre = progPre;
+    S.locPre.u_src = gl.getUniformLocation(progPre, "u_src");
+    S.fbo = gl.createFramebuffer();
+
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, "a_pos");
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    useQuad(prog);
 
     for (const n of ["u_photo", "u_depth", "u_res", "u_tex", "u_fpx", "u_fmm", "u_fstop", "u_focus",
-      "u_scale", "u_blur", "u_highlight", "u_maxblur", "u_dnear", "u_dfar", "u_mode", "u_taps"]) {
+      "u_scale", "u_blur", "u_highlight", "u_maxblur", "u_dnear", "u_dfar", "u_mode", "u_taps", "u_linear"]) {
       S.loc[n] = gl.getUniformLocation(prog, n);
     }
 
-    for (const key of ["photo", "depth"]) {
+    for (const key of ["photo", "depth", "linear"]) {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -205,6 +278,52 @@ void main() {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       S.tex[key] = t;
     }
+  }
+
+  // Attribute locations are per-program state, and the pre-pass program is a
+  // different program — re-point the shared quad buffer at whichever program
+  // is about to draw.
+  function useQuad(prog) {
+    const gl = S.gl;
+    if (prog._aPos === undefined) prog._aPos = gl.getAttribLocation(prog, "a_pos");
+    gl.enableVertexAttribArray(prog._aPos);
+    gl.vertexAttribPointer(prog._aPos, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  // Render the sRGB photo texture into the linear-light target, once per
+  // photo. Half float where the driver can render to it; an 8-bit linear
+  // target as fallback (the pipeline stays linear, it just bands sooner in
+  // the shadows). If even that fails, S.linearOK stays false and render()
+  // falls back to the raw photo texture with the legacy gamma behaviour.
+  function buildLinearTexture(w, h) {
+    const gl = S.gl;
+    const canFloat = !!(gl.getExtension("EXT_color_buffer_float") ||
+                        gl.getExtension("EXT_color_buffer_half_float"));
+    gl.bindTexture(gl.TEXTURE_2D, S.tex.linear);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (canFloat) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, S.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, S.tex.linear, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    if (ok) {
+      gl.viewport(0, 0, w, h);
+      gl.useProgram(S.progPre);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, S.tex.photo);
+      gl.uniform1i(S.locPre.u_src, 0);
+      useQuad(S.progPre);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    S.linearOK = ok;
+    return ok;
   }
 
   function uploadTextures(bitmap, depthRaw, meta) {
@@ -227,6 +346,8 @@ void main() {
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
     const half = new Uint16Array(depthRaw);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, meta.width, meta.height, 0, gl.RED, gl.HALF_FLOAT, half);
+
+    buildLinearTexture(bmp.width, bmp.height);
   }
 
   /* --------------------------------------------------------------- rendering */
@@ -236,10 +357,16 @@ void main() {
     if (!S.meta || !S.prog) return;
     if (!canvas.width || !canvas.height) return;
 
+    // The Original view bypasses the linear pipeline entirely, so the
+    // hold-Space comparison stays bit-exact in every configuration.
+    const effMode = S.holdOriginal ? 2 : S.mode;
+    const useLinear = S.linearOK && effMode !== 2;
+
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.useProgram(S.prog);
+    useQuad(S.prog);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, S.tex.photo);
+    gl.bindTexture(gl.TEXTURE_2D, useLinear ? S.tex.linear : S.tex.photo);
     gl.uniform1i(S.loc.u_photo, 0);
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
@@ -259,8 +386,9 @@ void main() {
     gl.uniform1f(S.loc.u_maxblur, Math.min(canvas.width, canvas.height) * 0.10);
     gl.uniform1f(S.loc.u_dnear, S.dLo);
     gl.uniform1f(S.loc.u_dfar, S.dHi);
-    gl.uniform1i(S.loc.u_mode, S.holdOriginal ? 2 : S.mode);
+    gl.uniform1i(S.loc.u_mode, effMode);
     gl.uniform1i(S.loc.u_taps, taps || 96);
+    gl.uniform1i(S.loc.u_linear, useLinear ? 1 : 0);
 
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
