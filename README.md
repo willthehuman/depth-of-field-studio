@@ -50,7 +50,7 @@ launches take ~12 s to build the model on the CPU and hand it to the GPU.
 | **Focus** | Slider, *Auto* (median of the centre), *Centre*, or click anywhere in the photo. Distances are in metres, straight from the model. |
 | **Aperture** | f/1.0 → f/22 in third stops. |
 | **Lens** | *Native* uses the focal length the model estimates; 50/85/135 mm simulate a longer lens, which is how you get a portrait look out of a wide-angle frame. |
-| **Render** | WebGL2 disc-gather bokeh, 96 taps while you drag, 192 on export. Scatter-as-gather weighting keeps the in-focus subject from bleeding into the background. |
+| **Render** | WebGL2 disc-gather bokeh, 96 taps while you drag, 192 on export. The gather runs in **linear light**: the photo is decoded from sRGB into a half-float texture first, near-clipped highlights are expanded back above 1.0 so speculars render as glowing discs, and the result is encoded back to sRGB. Scatter-as-gather weighting keeps the in-focus subject from bleeding into the background. |
 | **Export** | Full-resolution JPEG/PNG rendered in the browser, plus the depth map as a PNG. |
 
 The depth-of-field band under the focus slider is the honest lens model
