@@ -50,7 +50,8 @@ launches take ~12 s to build the model on the CPU and hand it to the GPU.
 | **Focus** | Slider, *Auto* (median of the centre), *Centre*, or click anywhere in the photo. Distances are in metres, straight from the model. |
 | **Aperture** | f/1.0 → f/22 in third stops. |
 | **Lens** | *Native* uses the focal length the model estimates; 50/85/135 mm simulate a longer lens, which is how you get a portrait look out of a wide-angle frame. |
-| **Render** | WebGL2 single-pass scatter-as-gather bokeh in **linear light**. Each tap is weighted by the sample's own circle of confusion, so a sharp neighbour only reaches a pixel when its blur disc is wide enough — no foreground bleed and no halo at the subject edge. 96 taps preview, 192 on export, crisp polygon aperture, then the result is encoded to sRGB. |
+| **Zoom** | Wheel zooms about the cursor up to 12×, drag pans, double-click returns to fit. The DOF is recomputed at the zoomed resolution, so you inspect real pixels, not an upscale. Export always renders the whole frame. |
+| **Render** | WebGL2 single-pass scatter-as-gather bokeh in **linear light**. The interpolation rule follows the physics of which side of the focus plane you are on: on the far side a tap only counts if its own blur disc reaches the pixel, so a sharp foreground object cannot bleed a halo into the background; on the near side the object is in front and spreads freely over the background, so a defocused foreground object keeps a soft optical edge instead of a cut-out silhouette. The gather radius is the max CoC over a small cross, so sub-pixel edges gather the background blur instead of leaving a semi-sharp rim. 96 taps preview, 192 on export, then the result is encoded to sRGB. |
 | **Export** | Full-resolution JPEG/PNG rendered in the browser, plus the depth map as a PNG. |
 
 The depth-of-field band under the focus slider is the honest lens model

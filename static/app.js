@@ -30,6 +30,11 @@
     blur: 1,
     highlight: 0.15,
     lensMM: 0,
+    zoom: 1,
+    cx: 0.5,
+    cy: 0.5,
+    drag: null,
+    suppressClick: false,
     format: "jpeg",
     quality: 95,
     depthLow: null,
@@ -113,6 +118,8 @@ uniform int u_mode;
 uniform int u_linear;
 uniform int u_taps;
 uniform vec2 u_res;
+uniform float u_zoom;
+uniform vec2 u_center;
 
 const int MAXTAPS = 192;
 const float GOLDEN = 2.399963229728653;
@@ -164,20 +171,24 @@ vec3 depthRamp(float t) {
 }
 
 void main() {
-  vec3 base = textureLod(u_photo, v_uv, 0.0).rgb;
+  // The view samples a zoomed, panned window of the photo. All texture reads
+  // (photo, depth, gather taps) go through puv; the centre is clamped so the
+  // window never leaves the frame.
+  vec2 puv = clamp(u_center + (v_uv - 0.5) / u_zoom, vec2(0.0), vec2(1.0));
+  vec3 base = textureLod(u_photo, puv, 0.0).rgb;
   if (u_mode == 2) {
     outColor = vec4(encode(base), 1.0);
     return;
   }
 
-  float d = textureLod(u_depth, v_uv, 0.0).r;
+  float d = textureLod(u_depth, puv, 0.0).r;
   if (u_mode == 1) {
     // The depth map is a data view: interpolate METRES, not disparity. A
     // bilinear read of 1/z across a silhouette lands mid-ramp (fake orange
     // fringe); averaging z instead blends toward the far value, which is what
     // the eye expects at a depth discontinuity.
     vec2 dsz = vec2(textureSize(u_depth, 0));
-    vec2 tuv = v_uv * dsz - 0.5;
+    vec2 tuv = puv * dsz - 0.5;
     ivec2 i0 = ivec2(floor(tuv));
     vec2 f = clamp(tuv - vec2(i0), 0.0, 1.0);
     ivec2 i1 = min(i0 + 1, ivec2(dsz) - 1);
@@ -193,7 +204,20 @@ void main() {
     return;
   }
 
-  float radius = 0.5 * min(cocDiameter(d), u_maxblur);
+  // Max-CoC over a small cross, but only on the far side of focus. There, a
+  // sub-pixel edge pixel must gather the background's disc or it leaves a
+  // semi-sharp rim. On the near side the object's own CoC decides its contour:
+  // letting a farther neighbour inflate it ate the edge of an in-focus subject.
+  vec2 dtx = 1.5 / vec2(textureSize(u_depth, 0));
+  float rNear = max(
+      max(cocDiameter(textureLod(u_depth, clamp(puv + vec2(dtx.x, 0.0), 0.0, 1.0), 0.0).r),
+          cocDiameter(textureLod(u_depth, clamp(puv - vec2(dtx.x, 0.0), 0.0, 1.0), 0.0).r)),
+      max(cocDiameter(textureLod(u_depth, clamp(puv + vec2(0.0, dtx.y), 0.0, 1.0), 0.0).r),
+          cocDiameter(textureLod(u_depth, clamp(puv - vec2(0.0, dtx.y), 0.0, 1.0), 0.0).r)));
+  float ownCoc = cocDiameter(d);
+  float dFocus = 1.0 / clamp(u_focus, 0.05, 4000.0);
+  float cocPx = d < dFocus ? max(ownCoc, rNear) : ownCoc;
+  float radius = 0.5 * min(cocPx, u_maxblur);
   if (radius < 0.55) {
     outColor = vec4(encode(base), 1.0);
     return;
@@ -212,12 +236,21 @@ void main() {
     float fi = float(i) + 0.5;
     float r = sqrt(fi / float(u_taps)) * radius;
     float a = fi * GOLDEN + spin;
-    vec2 suv = clamp(v_uv + vec2(cos(a), sin(a)) * r / u_res, vec2(0.0), vec2(1.0));
+    vec2 suv = clamp(puv + vec2(cos(a), sin(a)) * r / (u_res * u_zoom), vec2(0.0), vec2(1.0));
 
     vec3 sc = textureLod(u_photo, suv, 0.0).rgb;
     float sd = textureLod(u_depth, suv, 0.0).r;
     float srad = 0.5 * min(cocDiameter(sd), u_maxblur);
-    float w = smoothstep(r - 1.5, r + 1.5, srad);
+
+    // Interpolation rule depends on which side of the focus plane we are on.
+    // Far side: a tap only counts if its own blur disc reaches this pixel, so a
+    // sharp foreground object cannot bleed a halo into the background.
+    // Near side: the object is in front, so it must be free to spread over the
+    // background (uniform taps). Requiring srad there left defocused foreground
+    // objects with a hard, cut-out silhouette.
+    // Near side (d > dFocus): the object spreads over the background; far side
+    // keeps the strict CoC test so a sharp foreground cannot halo outward.
+    float w = d > dFocus ? 1.0 : smoothstep(r - 1.5, r + 1.5, srad);
 
     // Specular emphasis, the way a fast lens lifts point highlights.
     w *= 1.0 + u_highlight * smoothstep(0.55, 0.95, max(sc.r, max(sc.g, sc.b)));
@@ -503,7 +536,7 @@ void main() {
     S.locFinal = uniformLocations(gl, S.progFinal, [
       `u_photo`, `u_depth`, `u_fpxNative`, `u_fmm`,
       `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxblur`, `u_highlight`,
-      `u_dnear`, `u_dfar`, `u_mode`, `u_linear`, `u_taps`, `u_res`,
+      `u_dnear`, `u_dfar`, `u_mode`, `u_linear`, `u_taps`, `u_res`, `u_zoom`, `u_center`,
     ]);
     S.locLayer = uniformLocations(gl, S.progLayer, [
       `u_photo`, `u_depth`, `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`,
@@ -861,7 +894,7 @@ void main() {
     gl.uniform1f(S.locFinal.u_fmm, fmm);
     gl.uniform1f(S.locFinal.u_fstop, FSTOPS[S.fstopIdx]);
     gl.uniform1f(S.locFinal.u_focus, S.focus);
-    gl.uniform1f(S.locFinal.u_scale, canvas.width / m.width);
+    gl.uniform1f(S.locFinal.u_scale, canvas.width / m.width * S.zoom);
     gl.uniform1f(S.locFinal.u_blur, S.blur);
     gl.uniform1f(S.locFinal.u_maxblur, Math.min(canvas.width, canvas.height) * 0.10);
     gl.uniform1f(S.locFinal.u_highlight, S.highlight);
@@ -871,6 +904,8 @@ void main() {
     gl.uniform1i(S.locFinal.u_linear, useLinear ? 1 : 0);
     gl.uniform1i(S.locFinal.u_taps, Math.max(8, Math.min(192, taps || PREVIEW_TAPS)));
     gl.uniform2f(S.locFinal.u_res, canvas.width, canvas.height);
+    gl.uniform1f(S.locFinal.u_zoom, S.zoom);
+    gl.uniform2f(S.locFinal.u_center, S.cx, S.cy);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     if (S.busy) glError(gl, "final render", false);
   }
@@ -983,6 +1018,23 @@ void main() {
     $("highlightOut").textContent = S.highlight.toFixed(2);
   }
 
+  /* ------------------------------------------------------------------- zoom/pan */
+
+  function clampView() {
+    S.zoom = clamp(S.zoom, 1, 12);
+    const half = 0.5 / S.zoom;
+    S.cx = clamp(S.cx, half, 1 - half);
+    S.cy = clamp(S.cy, half, 1 - half);
+  }
+
+  function updateZoomUI() {
+    const view = $("view");
+    view.style.cursor = S.zoom > 1 ? "grab" : "crosshair";
+    $("hudHint").innerHTML = S.zoom > 1
+      ? `Zoom ${Math.round(S.zoom * 100)}% · drag to pan · double-click to fit`
+      : `Click photo to focus · wheel to zoom · <kbd>Space</kbd> original`;
+  }
+
   function setMode(mode) {
     S.mode = mode;
     document.querySelectorAll("#viewTabs .chip").forEach((c) => {
@@ -1025,6 +1077,9 @@ void main() {
       const meta = await res.json();
       if (!res.ok || meta.error) throw new Error(meta.error || `HTTP ${res.status}`);
       S.meta = meta;
+      S.zoom = 1;
+      S.cx = 0.5;
+      S.cy = 0.5;
 
       $("overlayTitle").textContent = "Loading depth";
       $("overlaySub").textContent = `${meta.width} × ${meta.height} px`;
@@ -1156,22 +1211,28 @@ void main() {
     const w = Math.round(meta.width * k);
     const h = Math.round(meta.height * k);
 
-    overlay(true, "Rendering", `${w} × ${h} px · layered mip bokeh · ${taps} aperture taps`, 35);
+    overlay(true, "Rendering", `${w} × ${h} px · single-pass bokeh · ${taps} aperture taps`, 35);
     await sleep(60);
 
     const prevW = canvas.width, prevH = canvas.height;
     const prevMode = S.mode;
+    const prevZoom = S.zoom, prevCx = S.cx, prevCy = S.cy;
     canvas.width = w;
     canvas.height = h;
     S.mode = mode;
+    S.zoom = 1; S.cx = 0.5; S.cy = 0.5;   // export is always the whole frame
     render(taps, true);
 
     const blob = await new Promise((res) => canvas.toBlob(res, mime, S.quality / 100));
 
     S.mode = prevMode;
+    S.zoom = prevZoom;
+    S.cx = prevCx;
+    S.cy = prevCy;
     canvas.width = prevW;
     canvas.height = prevH;
     layout();
+    updateZoomUI();
     overlay(false);
 
     if (!blob) throw new Error("The browser could not encode the image.");
@@ -1327,10 +1388,12 @@ void main() {
     $("saveDepth").onclick = exportDepth;
 
     $("view").addEventListener("click", (e) => {
+      if (S.suppressClick) { S.suppressClick = false; return; } // that was a pan
+      if (e.detail > 1) return; // second click of a double-click: don't refocus
       if (!S.meta || S.mode === 2) return; // focus picking works in Result and Depth Map
       const rect = $("view").getBoundingClientRect();
-      const u = (e.clientX - rect.left) / rect.width;
-      const v = (e.clientY - rect.top) / rect.height;
+      const u = S.cx + ((e.clientX - rect.left) / rect.width - 0.5) / S.zoom;
+      const v = S.cy + ((e.clientY - rect.top) / rect.height - 0.5) / S.zoom;
       const z = depthAt(u, v);
       if (!z || !isFinite(z)) return;
       S.focus = clamp(z, S.dLo, S.dHi);
@@ -1347,6 +1410,59 @@ void main() {
       ring.hidden = false;
       clearTimeout(ring._t);
       ring._t = setTimeout(() => { ring.hidden = true; }, 600);
+    });
+
+    const viewEl = $("view");
+    viewEl.addEventListener("wheel", (e) => {
+      if (!S.meta) return;
+      e.preventDefault();
+      const rect = viewEl.getBoundingClientRect();
+      const sx = (e.clientX - rect.left) / rect.width;
+      const sy = (e.clientY - rect.top) / rect.height;
+      // keep the photo point under the cursor fixed while zooming
+      const px = S.cx + (sx - 0.5) / S.zoom;
+      const py = S.cy + (sy - 0.5) / S.zoom;
+      S.zoom = clamp(S.zoom * Math.exp(-e.deltaY * 0.0015), 1, 12);
+      S.cx = px - (sx - 0.5) / S.zoom;
+      S.cy = py - (sy - 0.5) / S.zoom;
+      clampView();
+      updateZoomUI();
+      requestRender();
+    }, { passive: false });
+
+    viewEl.addEventListener("mousedown", (e) => {
+      if (!S.meta || e.button !== 0) return;
+      S.suppressClick = false;
+      S.drag = { x: e.clientX, y: e.clientY, cx: S.cx, cy: S.cy, moved: false,
+                 rect: viewEl.getBoundingClientRect() };
+      if (S.zoom > 1) viewEl.style.cursor = "grabbing";
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      if (!S.drag) return;
+      const d = S.drag;
+      if (!d.moved && Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) < 3) return;
+      d.moved = true;
+      S.cx = d.cx - (e.clientX - d.x) / d.rect.width / S.zoom;
+      S.cy = d.cy - (e.clientY - d.y) / d.rect.height / S.zoom;
+      clampView();
+      requestRender();
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (!S.drag) return;
+      S.suppressClick = S.drag.moved; // a pan must not also set focus
+      S.drag = null;
+      updateZoomUI();
+    });
+
+    viewEl.addEventListener("dblclick", () => {
+      if (!S.meta) return;
+      S.zoom = 1;
+      S.cx = 0.5;
+      S.cy = 0.5;
+      updateZoomUI();
+      requestRender();
     });
 
     window.addEventListener("keydown", (e) => {
@@ -1443,6 +1559,7 @@ void main() {
 
   initGL();
   wire();
+  updateZoomUI();
   $("panel").classList.add("empty-state");
   $("view").classList.add("hidden");
   $("fstop").value = S.fstopIdx;
