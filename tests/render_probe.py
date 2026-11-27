@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import subprocess
 import sys
 import time
@@ -24,9 +25,6 @@ from websockets.sync.client import connect
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = 9341
-URL = "http://127.0.0.1:7860/?debug=1"
-CHROME = "/usr/sbin/chromium"
-PROFILE = Path("/home/crow/.hermes/cache/scratch/dof-consult/chrome-profile-probe")
 
 
 class CDP:
@@ -76,14 +74,14 @@ def wait_http(url: str, timeout_s: float = 60.0) -> None:
     raise RuntimeError(f"{url} did not come up")
 
 
-def launch_browser() -> subprocess.Popen:
-    PROFILE.mkdir(parents=True, exist_ok=True)
+def launch_browser(url: str, chrome: str, profile: Path) -> subprocess.Popen:
+    profile.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen([
-        CHROME, "--headless=new", f"--remote-debugging-port={PORT}",
-        f"--user-data-dir={PROFILE}", "--no-first-run", "--no-default-browser-check",
+        chrome, "--headless=new", f"--remote-debugging-port={PORT}",
+        f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
         "--no-sandbox", "--disable-dev-shm-usage", "--hide-scrollbars",
         "--window-size=1400,900", "--enable-unsafe-swiftshader",
-        "--use-gl=angle", "--use-angle=swiftshader", URL,
+        "--use-gl=angle", "--use-angle=swiftshader", url,
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_http(f"http://127.0.0.1:{PORT}/json/version")
     return proc
@@ -113,15 +111,21 @@ def main() -> None:
     ap.add_argument("--mode", type=int, default=0)
     ap.add_argument("--coin-debug", action="store_true",
                     help="read the near/far blur texels at the mock coin centre")
+    ap.add_argument("--port", type=int, default=7860, help="mock server port")
+    ap.add_argument("--chromium", default=os.environ.get("CHROMIUM", "/usr/sbin/chromium"),
+                    help="Chromium/Chrome binary (or $CHROMIUM)")
+    ap.add_argument("--profile", default=str(Path.home() / ".cache" / "dof-probe-profile"),
+                    help="headless browser profile directory")
     args = ap.parse_args()
 
+    url = f"http://127.0.0.1:{args.port}/?debug=1"
     server = subprocess.Popen([sys.executable, str(ROOT / "tests" / "mock_depth_server.py"),
-                               "--port", "7860"], cwd=ROOT,
+                               "--port", str(args.port)], cwd=ROOT,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     browser = None
     try:
-        wait_http("http://127.0.0.1:7860/api/status")
-        browser = launch_browser()
+        wait_http(f"http://127.0.0.1:{args.port}/api/status")
+        browser = launch_browser(url, args.chromium, Path(args.profile))
         targets = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/list").read())
         page = next((t for t in targets if t["type"] == "page" and "127.0.0.1" in t.get("url", "")), None)
         if page is None:
@@ -131,7 +135,7 @@ def main() -> None:
         cdp.send("Log.enable")
         cdp.send("Page.enable")
         if "127.0.0.1" not in page.get("url", ""):
-            cdp.send("Page.navigate", url=URL)
+            cdp.send("Page.navigate", url=url)
         if not cdp.wait_for("document.readyState === 'complete' && !!document.getElementById('sampleBtn')", 60):
             raise RuntimeError("page did not load")
 
@@ -154,15 +158,18 @@ def main() -> None:
               d.S.focus = {args.focus}; d.S.fstopIdx = {args.fstop};
               d.S.lensMM = {args.lens}; d.S.blur = {args.blur};
               d.S.highlight = {args.highlight}; d.S.grain = {args.grain};
-              d.S.mode = 0; d.S.holdOriginal = false; d.S.zoom = 1;
-              d.S.cx = 0.5; d.S.cy = 0.5;
+              d.S.mode = 1; d.S.holdOriginal = false; d.S.zoom = 2;
+              d.S.cx = 0.4; d.S.cy = 0.6;
               d.updateFocusUI(); d.updateLensUI();
               return true;
             }})()""")
             exported = cdp.eval(
                 "window.__dof.exportRender({mode:0,mime:'image/png',ext:'png',taps:192,tag:'probe'})"
-                ".then(() => ({mode: window.__dof.S.mode, w: document.getElementById('view').width,"
-                " h: document.getElementById('view').height, glErr: window.__dof.S.gl.getError()}))",
+                ".then(() => ({mode: window.__dof.S.mode, zoom: window.__dof.S.zoom,"
+                " cx: window.__dof.S.cx, cy: window.__dof.S.cy,"
+                " w: document.getElementById('view').width,"
+                " h: document.getElementById('view').height,"
+                " glErr: window.__dof.S.gl.getError(), glErrors: window.__dof.S.glErrors || 0}))",
                 await_promise=True, timeout_s=420)
             deadline = time.time() + 60
             out_file = None
@@ -248,6 +255,11 @@ def main() -> None:
                   out.push([x, 300, +read(d.S.targets.nearBlur, x, 300)[3].toFixed(3)]);
                 return out;
               }})(),
+              edgeAlpha: (() => {{
+                const out = [];
+                for (let x = 150; x <= 260; x++) out.push(+read(d.S.targets.nearBlur, x, 360)[3].toFixed(3));
+                return out;
+              }})(),
             }};
           }}
           const data = c.toDataURL('image/png');
@@ -260,7 +272,7 @@ def main() -> None:
             data,
             w: c.width, h: c.height,
             focus: d.S.focus, fstop: d.S.fstopIdx, lens: d.S.lensMM,
-            glErr, coin,
+            glErr, glErrors: d.S.glErrors || 0, coin,
             meta: {{width: d.S.meta.width, height: d.S.meta.height, f_px: d.S.meta.f_px}},
           }};
         }})()"""

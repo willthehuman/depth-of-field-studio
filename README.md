@@ -54,7 +54,7 @@ launches take ~12 s to build the model on the CPU and hand it to the GPU.
 | **Render** | Two-field WebGL2 bokeh in **linear light**: a far/focus field with a per-tap CoC reach test and a 16-tap background fill, then a near field with a **premultiplied coverage alpha**, so a defocused foreground spreads over a sharp background instead of being cut out. The near gather radius comes from a **tile-max + neighbour-max CoC field**, not a colour-mip average, so a small very defocused object keeps its full disc. The aperture is a nine-blade polygon whose roundness follows the f-stop, with equal-radius cat's-eye clipping toward the frame edge and an energy-neutral spherical-aberration rim; the gather covers the polygon's circumradius, so the 9-gon is actually visible at f/4+. A tap beyond the pixel's own blur radius must be nearer than the destination, so a blurrier background cannot paint over the midground. 96 taps preview, 192 export, prefiltered to the tap spacing. |
 | **Highlights** | A 0–5 stop slider expands only clipped, isolated speculars in a full-resolution **radiance texture**, before the layer mips prefilter the colour. Bokeh balls carry real energy, the sharp base stays unexpanded, and preview/export agree at every scale. Large clipped areas (sky, windows) are left alone. |
 | **Grain** | Matching grain in blurred areas, weighted by the local defocus and by signal (shot-noise-like), so a wide-aperture render does not look unnaturally clean at 1:1. |
-| **Export** | Full-resolution JPEG/PNG rendered in the browser, plus the depth map as a PNG. Export draws are split into 512-row bands with a flush between them to stay under the Windows TDR limit. |
+| **Export** | Full-resolution JPEG/PNG rendered in the browser, plus the depth map as a PNG. Export draws are split into ≤ 2 MP scissored bands with a flush between them to stay under the Windows TDR limit. |
 
 The depth-of-field band under the focus slider is the honest lens model
 (35 mm-equivalent focal length, 30 µm CoC, hyperfocal distance), so it tells you
@@ -64,20 +64,21 @@ not the optics.
 
 ## Hardware
 
-Tuned for a 6 GB card. The released weights are float32 (3.3 GB); the app builds
-the model on the CPU, casts the encoder and decoder to bf16 (they only ever run
-under bf16 autocast anyway) and keeps the depth head and focal estimator in
-float32. Inference peaks at 3.96 GB at 1280 px, 4.9 GB at 1536 px
-(`set DEPTH_SIDE=1536` to try it). If the card is full it retries at 1024 → 768.
+Tuned for a 6 GB card. The released checkpoint is a 3.3 GB float32 download; the
+app builds the model on the CPU, casts the encoder and decoder to bf16 (they
+only ever run under bf16 autocast anyway) and keeps the depth head and focal
+estimator in float32. The resident encoder/decoder is about 1.8 GB. Inference
+peaks at 3.96 GB at 1280 px, 4.9 GB at 1536 px (`set DEPTH_SIDE=1536` to try
+it). If the card is full it retries at 1024 → 768.
 
 The two-field renderer keeps four canvas-sized float layer textures plus their
 mips, two blur targets, the full-resolution linear photo and the full-resolution
 radiance texture. At 24 MP that is roughly 2 GB of export buffers. `app.py`
 releases the transient H+ activations with `torch.cuda.empty_cache()` after the
-estimate, but the 3.3 GB of weights stay resident, so 24 MP is tight on the 6 GB
-target; 8 GB is the comfortable figure. An 8192 px export can exceed it. The
-export is drawn in 512-row bands with a flush between draws to stay under the
-Windows TDR limit.
+estimate, but the bf16 encoder/decoder (about 1.8 GB) and the float32 head stay
+resident, so 24 MP is tight on the 6 GB target; 8 GB is the comfortable figure.
+An 8192 px export can exceed it. The export is drawn in ≤ 2 MP bands with a
+flush between draws to stay under the Windows TDR limit.
 
 ## Layout
 

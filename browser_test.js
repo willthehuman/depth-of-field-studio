@@ -357,7 +357,10 @@
     const bmp = await createImageBitmap(exports[0].blob);
     out.exportBlob.width = bmp.width;
     out.exportBlob.height = bmp.height;
-    if (bmp.width < 1000 || bmp.height < 700) fail.push(`export is not full resolution (${bmp.width}x${bmp.height})`);
+    const meta = window.__dof && window.__dof.S.meta;
+    const expW = meta ? meta.width : served.width;
+    const expH = meta ? meta.height : served.height;
+    if (bmp.width !== expW || bmp.height !== expH) fail.push(`export is not full resolution (${bmp.width}x${bmp.height}, expected ${expW}x${expH})`);
   } else {
     fail.push("export produced no blob");
   }
