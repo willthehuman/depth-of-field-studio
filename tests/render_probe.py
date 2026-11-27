@@ -270,6 +270,11 @@ def main() -> None:
                 x, y, +read(d.S.tex.depth, x, y)[0].toFixed(5),
                 +read(d.S.tex.depthSnap, x, y)[0].toFixed(5),
               ]),
+              ramp: Array.from({{ length: 9 }}, (_, i) => {{
+                const x = 380 + i;
+                return [x, +read(d.S.tex.depth, x, 590)[0].toFixed(5),
+                        +read(d.S.tex.depthSnap, x, 590)[0].toFixed(5)];
+              }}),
               nearAlpha: (() => {{
                 const out = [];
                 for (const y of [40, 100, 140, 170, 190, 205, 300, 400, 520, 600])

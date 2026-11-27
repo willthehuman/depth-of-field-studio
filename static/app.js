@@ -836,26 +836,9 @@ void main() {
   }
 
   // The tap set has no centre sample: the first ring is at sqrt(0.5/N)*R, so a
-  // small-CoC source would contribute zero alpha. Always add the destination's
-  // own mip-0 sample, weighted by the untapped central hole, and with no rim
-  // (rim(0) = 0.9 would cap the rescued alpha at 0.9). It is composited under
-  // the nearer-source bucket so it cannot punch through a nearer foreground.
-  vec4 self0 = textureLod(u_layerTex, uv, 0.0);
-  if (self0.a > 0.02) {
-    float selfCov = self0.a;
-    float selfRad = textureLod(u_infoTex, uv, 0.0).r * u_infoScale / selfCov;
-    float selfRadE = max(selfRad, 0.5);
-    vec3 selfCol = self0.rgb / selfCov;
-    float selfShape = apertureShape(vec2(0.0), field, u_fstop, 0.0);
-    // Only fill the hole the tap set actually leaves. With the inner set the
-    // first tap is much closer, so an always-on self tap would double-count the
-    // centre and bias a nearly-sharp source toward its own colour.
-    float firstR = innerN > 0 ? sqrt(0.5 / float(innerN)) * rInner : hole;
-    float selfW = selfRadE < firstR
-      ? selfShape * min(1.0, (firstR * firstR) / (selfRadE * selfRadE))
-      : 0.0;
-    acc += vec4(selfCol * selfCov * selfW, selfCov * selfW);
-  }
+  // small-CoC source would contribute zero alpha. The 0.5 px sradE floor and
+  // the inner tap set cover that case; an always-on self tap was removed after
+  // it proved unreachable (selfRadE >= firstR in every branch).
   float occ = clamp(fg.a / max(shapeArea, 0.20), 0.0, 1.0);
   acc = fg + acc * (1.0 - occ);
 

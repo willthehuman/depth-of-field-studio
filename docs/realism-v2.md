@@ -27,13 +27,15 @@ everything else is client-side.
   weight floor, a near pixel whose CoC is below 0.5 px had an expected alpha of
   `4·srad²` — near content just in front of the focus plane went 20–80 %
   transparent to the far fill (rows 165–191 of the mock read 0.21–0.98). The
-  destination's own sample is now always added as a rim-free self tap weighted
-  by the untapped central hole (with the tap-area scaling removed), so the same
-  rows read 0.96–1.0 and the 4 m rectangle reads 0.99–1.0.
+  0.5 px floor and the 24-tap inner set cover that case; the same rows read
+  0.96–1.0 and the 4 m rectangle reads 0.99–1.0. An always-on self tap was
+  removed after it proved unreachable (`selfRadE >= firstR` in every branch).
 * **Near-over-near ordering.** Taps whose source is nearer than the destination
-  (`sd > d`) go to a separate `fg` bucket and the near value is
-  `fg + acc·(1 − fg.a)`, so a nearer foreground occludes the destination's own
-  pixel instead of being cut behind it.
+  (`sd > d`) go to a separate `fg` bucket. The occlusion is normalised,
+  `occ = fg.a / max(shapeArea, 0.2)`, and the near value is
+  `fg + acc·(1 − occ)`, so a nearer foreground occludes the destination's own
+  pixel instead of being cut behind it and an unnormalised `fg.a` cannot
+  subtract colour.
 * **Near radius from a true max.** A 32 px tile-max of the near CoC plus a
   reach-limited neighbour-max (a tile contributes only if its own CoC reaches
   the destination tile) replaces the coverage-weighted colour-mip probe. A
@@ -50,8 +52,11 @@ everything else is client-side.
   holds at most 55 %, and the two cluster means differ in colour
   (`|mn − mf|² > 0.01`). A real step has plateaus on both sides; a planar slope
   (even textured) spreads through the middle and is left smooth. The mock now
-  has a textured 0.7–2.2 m ground plane; the snap equals the raw depth at three
-  points on it. The snap is built once per photo, not per focus tick. It is
+  has a textured 0.7–2.2 m ground plane (snap equals raw depth at three points)
+  and a 9 px 2–4 m ramp with plateaus. On the ramp, six of the nine samples
+  snap to a plateau and one edge pixel remains mixed; the snap reduces a guided
+  outline but does not erase every mixed pixel. It is built once per photo, not
+  per focus tick. It is
   stored in **photo orientation** (the FBO row is flipped once in `SNAP_FRAG`);
   every reader indexes `texelFetch(u_depthSnap, p, 0)` top-down, so a
   bottom-of-frame near object is not classified with the top plane's depth. A
@@ -160,19 +165,23 @@ unless stated:
 On an RTX 4070 SUPER (12 GB), with the real Depth Pro 2 H+ weights and the real
 client (not the mock):
 
-- Model load 9.2 s warm; 1920×1440 analysis 0.70 s; 5656×4242 analysis 3.11 s
-  (inference 0.76 s, refine 0.14 s); peak inference VRAM 3.96 GB.
-- 5656×4242 export: 21.9 MB PNG, 3.0 s including the real analysis; tiled vs
-  non-tiled **0.000 / 0.0**; whole-render GPU use ~2.8 GB.
-- `cdp_test.py` browser suite against the real app: **ok: true**, no failures;
-  export 1920×1440; click-to-focus while zoomed works; zoom anchor drift
-  3.7/255 on a 5×5 patch.
-- 0.4× preview vs the 24 MP export downsampled: mean 0.460/255, p99 4.0,
-  max 31; top-decile gradient band mean 1.26/255.
+- Model load 9.2 s warm; 1920×1440 analysis 0.70 s; 5656×4242 standalone
+  `test_backend.py` analysis 3.11 s (the app reports 1.3 s for the same job);
+  inference 0.76 s, refine 0.14 s. The reported 3.96 GB peak is read before
+  `guided_upsample`; the refine pass is not separately sampled.
+- 5656×4242 export: 21.9 MB PNG, 4.0 s wall including browser startup and
+  analysis; tiled vs non-tiled **0.000 / 0.0**. `nvidia-smi` sampled 2.8 GiB
+  total during the export, but the texture accounting plus the resident model
+  is about 3.7 GB; the 6 GB fit is not measured.
+- `cdp_test.py` browser suite against the real model server: **ok: true**, no
+  failures; export 1920×1440; click-to-focus while zoomed works. WebGL ran on
+  SwiftShader in that suite. Zoom anchor drift is a 3.7 code **sum** over three
+  channels on a 5×5 patch, not a 0–255 mean.
+- 0.4× preview vs the 24 MP export downsampled: mean 0.458/255, p99 4.0,
+  max 39; top-decile gradient band mean 1.25/255.
 
-The 6 GB card was the original target; the model and 24 MP render now fit on
-the 12 GB card with measured headroom, but the 6 GB re-run is still open.
-SwiftShader timings are not representative of this GPU.
+The 6 GB card was the original target; the 12 GB run shows the actual
+inference and texture costs, but the 6 GB re-run is still open.
 
 ## Deliberately not done
 

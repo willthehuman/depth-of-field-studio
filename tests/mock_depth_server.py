@@ -41,6 +41,12 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     # range is well above the snap threshold but which is not a discontinuity.
     slope = (xx > 80) & (xx < 280) & (yy > 500) & (yy < 620)
     z_slope = 0.70 + 1.50 * (xx - 80) / 200.0
+    # A 9 px guided-style ramp from 2 m to 4 m, with a colour edge. The snap
+    # should pull the centre to a plateau; a ~1 px mixed edge remains.
+    ramp = (xx >= 380) & (xx <= 388) & (yy > 560) & (yy < 620)
+    z_ramp = 2.0 + 2.0 * (xx - 380) / 8.0
+    rampL = (xx >= 360) & (xx < 380) & (yy > 560) & (yy < 620)
+    rampR = (xx > 388) & (xx <= 408) & (yy > 560) & (yy < 620)
 
     base = 0.32 + 0.10 * np.sin(xx / 23.0) + 0.07 * np.cos(yy / 31.0)
     img = np.stack([base * 0.82, base * 0.92, base * 1.10], axis=-1)
@@ -55,6 +61,14 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
         0.30 + 0.16 * np.cos(yy / 6.0),
         0.26 + 0.14 * np.sin((xx + yy) / 7.0),
     ], axis=-1)[slope]
+    rampT = np.clip((xx - 380) / 8.0, 0.0, 1.0)
+    img[ramp] = np.stack([
+        0.62 - 0.30 * rampT,
+        0.20 + 0.28 * rampT,
+        0.18 + 0.34 * rampT,
+    ], axis=-1)[ramp]
+    img[rampL] = np.array([0.62, 0.20, 0.18])
+    img[rampR] = np.array([0.32, 0.48, 0.52])
     spec = (xx - 300) ** 2 + (yy - 320) ** 2 < 5 ** 2
     img[spec] = [1.0, 1.0, 1.0]
     img += rng.normal(0.0, 0.018, img.shape)
@@ -65,6 +79,9 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     z[near] = 1.5
     z[small] = 1.5
     z[slope] = z_slope[slope]
+    z[ramp] = z_ramp[ramp]
+    z[rampL] = 2.0
+    z[rampR] = 4.0
     inv = (1.0 / z).astype(np.float32)
     return (img * 255.0 + 0.5).astype(np.uint8), inv
 
