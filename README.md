@@ -93,6 +93,7 @@ probe_sizes.py      measures VRAM and latency per inference size
 test_backend.py     headless pipeline check (no browser)
 tests/mock_depth_server.py  synthetic scene + depth, no torch/GPU needed
 tests/render_probe.py       headless Chromium probe: focus/aperture/zoom/export
+tests/evidence.py           regenerates docs/evidence.md from the head commit
 cdp_test.py         drives headless Brave over CDP: orientation, depth ordering,
                     aperture/refocus behaviour, zoom/pan, export path
                     -> browser_test.js
@@ -101,6 +102,11 @@ data/<id>/          cached photo.png + depth.f16 + meta.json (last 8 photos)
 ```
 
 ## Notes
+
+`python3 tests/evidence.py` runs the synthetic probe suite and writes
+`docs/evidence.md` (commit hash, commands and the numbers quoted above). The
+real-model commands are listed there too; they need the app server and the
+weights.
 
 * Depth is metric *for the camera that took the photo* — the model predicts depth
   in metres from a monocular cue, and the absolute scale is approximate on

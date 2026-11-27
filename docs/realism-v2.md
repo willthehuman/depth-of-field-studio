@@ -17,7 +17,7 @@ everything else is client-side.
   premultiplied colour; the final pass is Porter-Duff `over`
   (`n.rgb + f.rgb * (1 - n.a)`). The old mix of premultiplied early-outs and
   straight gather colours darkened an in-focus subject to 0.75× linear; the
-  flat-disc test now matches the original to 172.7/53.6/37.1 code values.
+  flat-disc test now matches the original to 173.3/55.8/38.2 code values (20×20 patch).
 * **Coverage alpha from mip 0.** The colour is prefiltered to the tap spacing,
   but coverage and the source's own CoC are read from mip 0. The coarse mip
   would smear the layer's coverage outward and turn the alpha into an opaque
@@ -127,17 +127,17 @@ unless stated:
   57 codes at the clipped specular because result mode resamples in linear light
   while original mode resamples in sRGB; that was a harness artefact, not the
   renderer. Focus exactly on the near disc at 1.5 m: the 120 px near patch is
-  172.7/53.6/37.1 (R/G/B) versus 172.6/53.5/37.0 for the original.
+  173.3/55.8/38.2 (R/G/B) versus 172.6/53.5/37.0 for the original; the G/B gap is ~2/255.
 * **Near edge.** The linear `nearBlur.a` 10–90% transition along y = 360 runs
-  x 179→229: **50 px**, within 2 % of the 49 px hard-disc (pillbox) prediction
+  x 181→229: **48 px**, within 2 % of the 49 px hard-disc (pillbox) prediction
   (1.37 R). The earlier 36 px figure was the colour transition, not the alpha;
   there is no truncation. The blur cap is not active in this frame (uncapped
   radius 35.8 px). The old colour-mip version measured ~56 px because it
   overestimated the near radius.
 * **Highlights.** A full-slider specular bokeh at focus 8 m: the 8 px core is
   **188/102/94** in the preview (971×647) and **186/99/89** in the export
-  (960×640). Preview vs export downsampled to 960 is 0.676 / 255 mean absolute.
-* **Small object.** The 8 px near coin's 16×16 centre is now **90.7/81.1/83.1**
+  (960×640). Preview vs export downsampled to 960 is 0.712 / 255 mean absolute.
+* **Small object.** The 8 px near coin's 16×16 centre is now **83.6/81.2/89.7**
   (R/G/B) against the ~80 analytic; the near layer's alpha is 0.045, the depth
   snap reads 0.6665 (1.5 m) and the near-coverage mips read 0.595 / 0.302 /
   0.088 at levels 3/4/5. The earlier 94/187 flip-flop was the depth snap being
@@ -148,13 +148,13 @@ unless stated:
   = 0.0998 linear ≈ 89 sRGB, with the 16×16 mean 90.7 because the patch includes
   the brighter coin edge. The +10 codes against 80 are the near layer's own red
   (0.716 straight × 0.045), not a far-fill error. The flat near-disc centre still
-  matches the original at 172.7/172.6.
+  matches the original at 173.3/172.6.
 * **Polygon.** At f/8 the per-angle specular bokeh edge radius varies 7.5–11 px
-  (std 1.02). The 9-sector mean spread is 2.50 px and the 9th angular harmonic
-  is only ~0.1 px, so this 5 px source cannot isolate the 9-gon; the polygon is
+  (std 1.02). The 9th angular harmonic
+  is 0.18 px, so this 5 px source cannot isolate the 9-gon; the polygon is
   visible but this metric does not demonstrate it. The theoretical
   vertex/inradius difference is ~0.6 px at that edge.
-* **Preview vs export.** 0.676 / 255 mean absolute between the 971×647 preview
+* **Preview vs export.** 0.712 / 255 mean absolute between the 971×647 preview
   and the 960×640 export downsampled to 960, 96/192 taps, with grain on.
 * **Zoom.** A 4× centre crop vs the export's central 240×160 quarter upscaled:
   1.41 / 255 mean absolute, max 35; the earlier 2.37 was not a like-for-like
