@@ -240,6 +240,14 @@ def main() -> None:
               depth500: read(d.S.tex.depthSnap, 640, 500),
               depth100: read(d.S.tex.depthSnap, 640, 100),
               depth360: read(d.S.tex.depthSnap, 330, 360),
+              nearAlpha: (() => {{
+                const out = [];
+                for (const y of [40, 100, 140, 170, 190, 205, 300, 400, 520, 600])
+                  out.push([640, y, +read(d.S.targets.nearBlur, 640, y)[3].toFixed(3)]);
+                for (const x of [620, 650, 700, 760, 820, 850])
+                  out.push([x, 300, +read(d.S.targets.nearBlur, x, 300)[3].toFixed(3)]);
+                return out;
+              }})(),
             }};
           }}
           const data = c.toDataURL('image/png');

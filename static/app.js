@@ -705,6 +705,9 @@ void main() {
   float lod = clamp(log2(max(1.0, radius * sqrt(PI / float(u_taps)))) - 0.5, 0.0, u_maxLod);
   float A = PI * radius * radius / float(u_taps);
   vec4 acc = vec4(0.0);
+  vec4 fg = vec4(0.0);   // taps whose source is nearer than the destination
+  // The tap set leaves an untapped hole of this radius at the centre.
+  float hole = radius * sqrt(0.5 / float(u_taps));
 
   for (int i = 0; i < MAXTAPS; i++) {
     if (i >= u_taps) break;
@@ -720,17 +723,26 @@ void main() {
     vec4 s0 = textureLod(u_layerTex, sUV, 0.0);
     float cov = max(s0.a, 1e-4);
     float srad = textureLod(u_infoTex, sUV, 0.0).r * u_infoScale / cov;
+    // One 0.5 px floor for both the shape test and the weight. With the real
+    // srad in the shape and a 0.5 px weight floor, a near pixel whose CoC is
+    // below 0.5 px passes only taps inside srad yet is weighted as a 0.5 px
+    // disc, so the expected alpha is 4*srad^2 and nearly focused foreground
+    // turns transparent to the far fill.
+    float sradE = max(srad, 0.5);
     float reach = 1.0;
+    bool nearer = false;
 
     // A source beyond the destination's own blur radius is only allowed to
     // contribute if it is NEARER than the destination; otherwise a blurrier
-    // background would paint over the midground.
+    // background would paint over the midground. Nearer sources go to the
+    // fg bucket so they can be composited over the destination's own pixel.
     if (r > own + 1.0) {
       vec2 puvS = zoomUV(sUV);
       ivec2 sp = ivec2(clamp(puvS, 0.0, 1.0) * u_depthSize);
       sp = clamp(sp, ivec2(0), ivec2(u_depthSize) - 1);
       float sd = texelFetch(u_depth, sp, 0).r;
       if (sd < d) reach = 0.0;
+      else if (sd > d + 1e-4) nearer = true;
     }
 
     vec2 q = (uv - sUV) * u_res;
@@ -738,34 +750,35 @@ void main() {
     vec2 puvS = zoomUV(sUV);
     vec2 fieldS = (puvS - 0.5) * 2.0;
     fieldS.x *= u_res.x / max(u_res.y, 1.0);
-    float shape = apertureShape(q / max(srad, 1e-3), srad, fieldS,
+    float shape = apertureShape(q / sradE, sradE, fieldS,
                                 u_fstop, u_layer == 0 ? 1.0 : -1.0);
     // The weight of a fully covered source must integrate to 1. wFull is the
     // aperture-area share of this tap; reach is the source's own disc test.
     // The near-field alpha is the covered share divided by the full aperture
     // share, i.e. real coverage, not an opaque average.
-    float wFull = shape * A / (PI * max(srad * srad, 0.25));
+    float wFull = shape * A / (PI * sradE * sradE);
     float w = reach * wFull;
+    vec4 contrib = vec4(sc * cov * w, cov * w);
 
-    acc += vec4(sc * cov * w, cov * w);
+    if (nearer) fg += contrib; else acc += contrib;
   }
 
   // The tap set has no centre sample: the first ring is at sqrt(0.5/N)*R, so a
-  // near source with a CoC smaller than that would contribute zero alpha. Add
-  // the destination's own mip-0 sample as a self tap only for that small-CoC
-  // case; an extended defocused source must be built from the surrounding taps.
+  // small-CoC source would contribute zero alpha. Always add the destination's
+  // own mip-0 sample, weighted by the untapped central hole, and with no rim
+  // (rim(0) = 0.9 would cap the rescued alpha at 0.9). It is composited under
+  // the nearer-source bucket so it cannot punch through a nearer foreground.
   vec4 self0 = textureLod(u_layerTex, uv, 0.0);
-  if (self0.a > 0.02 && own < sqrt(0.5 / float(u_taps)) * radius) {
+  if (self0.a > 0.02) {
     float selfCov = self0.a;
     float selfRad = textureLod(u_infoTex, uv, 0.0).r * u_infoScale / selfCov;
+    float selfRadE = max(selfRad, 0.5);
     vec3 selfCol = self0.rgb / selfCov;
-    float selfShape = apertureShape(vec2(0.0), selfRad, field, u_fstop,
-                                     u_layer == 0 ? 1.0 : -1.0);
-    // One source pixel, not a tap area of A: the A scale made the self tap ~50x
-    // too heavy and cut foreground bokeh behind small-CoC near pixels.
-    float selfW = selfShape * min(1.0, 1.0 / (PI * max(selfRad * selfRad, 0.25)));
+    float selfShape = apertureShape(vec2(0.0), selfRadE, field, u_fstop, 0.0);
+    float selfW = selfShape * min(1.0, max(hole * hole, 0.25) / (selfRadE * selfRadE));
     acc += vec4(selfCol * selfCov * selfW, selfCov * selfW);
   }
+  acc = fg + acc * (1.0 - fg.a);
 
   // The scatter-as-gather alpha is the aperture coverage. With the depth snap
   // in photo orientation this is also the fraction of the destination PSF that

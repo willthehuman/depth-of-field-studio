@@ -22,6 +22,18 @@ everything else is client-side.
   but coverage and the source's own CoC are read from mip 0. The coarse mip
   would smear the layer's coverage outward and turn the alpha into an opaque
   average.
+* **Near small-CoC coverage.** One 0.5 px floor (`sradE`) is used in both the
+  shape test and the weight. With the real `srad` in the shape and a 0.5 px
+  weight floor, a near pixel whose CoC is below 0.5 px had an expected alpha of
+  `4·srad²` — near content just in front of the focus plane went 20–80 %
+  transparent to the far fill (rows 165–191 of the mock read 0.21–0.98). The
+  destination's own sample is now always added as a rim-free self tap weighted
+  by the untapped central hole (with the tap-area scaling removed), so the same
+  rows read 0.96–1.0 and the 4 m rectangle reads 0.99–1.0.
+* **Near-over-near ordering.** Taps whose source is nearer than the destination
+  (`sd > d`) go to a separate `fg` bucket and the near value is
+  `fg + acc·(1 − fg.a)`, so a nearer foreground occludes the destination's own
+  pixel instead of being cut behind it.
 * **Near radius from a true max.** A 32 px tile-max of the near CoC plus a
   reach-limited neighbour-max (a tile contributes only if its own CoC reaches
   the destination tile) replaces the coverage-weighted colour-mip probe. A
@@ -91,10 +103,11 @@ unless stated:
 * **Near edge.** The near disc's colour transition is ~36 px (10–90%), centred
   on the geometric edges (200/460); the old colour-mip version measured ~56 px
   because it overestimated the near radius. The blur cap is no longer active in
-  this frame (uncapped radius 35.8 px). A Gaussian-step prediction would be
-  ~49 px (1.37 R); the near layer is a **coverage** alpha from a hard polygon
-  aperture rather than a Gaussian, so a steeper 10–90% edge is expected, and the
-  36 px is not truncation.
+  this frame (uncapped radius 35.8 px). The hard-disc (pillbox) 10–90 %
+  prediction is ~49 px (1.37 R); the measured colour transition is 36 px, and
+  the linear `nearBlur.a` readback along y = 360 is the open check. There is no
+  truncation in the code that would explain a narrower edge, so this is not yet
+  closed.
 * **Highlights.** A full-slider specular bokeh at focus 8 m: the 8 px core is
   **188/102/94** in the preview (971×647) and **186/99/89** in the export
   (960×640); the core means agree to ~1 code value. Preview versus export at
