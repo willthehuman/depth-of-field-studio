@@ -77,9 +77,10 @@ Measured on the synthetic scene, 135 mm f/1.4, focus 8 m (near disc 1.5 m),
 unless stated:
 
 * **Focus-band brightness (the blocker).** `blur = 0` at focus 8 m against the
-  original: mean absolute 0.108 / 255, p99 1.0 / 255; a few pixels on the depth
-  band reach 57 / 255. Focus exactly on the near disc at 1.5 m: the 120 px near
-  patch is 173.8/57.0/39.4 (R/G/B) versus 173.7/56.8/39.1 for the original.
+  original: mean absolute 0.108 / 255, p99 1.0 / 255; a few pixels of the 5 px
+  clipped specular reach 57 / 255. Focus exactly on the near disc at 1.5 m: the
+  120 px near patch is 173.8/57.0/39.4 (R/G/B) versus 173.7/56.8/39.1 for the
+  original.
 * **Near edge.** The near disc's colour transition is ~36 px (10–90%), centred
   on the geometric edges (200/460); the old colour-mip version measured ~56 px
   because it overestimated the near radius. The blur cap is no longer active in
