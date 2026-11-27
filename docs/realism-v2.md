@@ -41,21 +41,23 @@ everything else is client-side.
   foreground does not pay for a full tap set.
 * **Depth test.** A tap beyond the destination's own blur radius only counts if
   it is nearer. A blurrier background cannot paint over the midground.
-* **Depth edges.** The 9×9 min/max snap runs once per photo at the **depth
-  resolution** into an R16F texture; the layer, blur and final `texelFetch` it
-  instead of repeating the search seven times per frame. The snap takes the
-  min/max depth and chooses the extreme whose cluster-mean colour is closest,
-  but only when the centre sits inside the mixed band, the window has at least
-  three samples in **each** 10 % extreme cluster, and the two cluster means
-  differ in colour (`|mn − mf|² > 0.01`). A real step has plateaus on both sides;
-  a smooth slope only touches each extreme at one or two samples, and a planar
-  colour ramp has no colour edge. The snap is built once per photo, not per
-  focus tick. It is stored in **photo orientation** (the FBO row
-  is flipped once in `SNAP_FRAG`); every reader indexes
-  `texelFetch(u_depthSnap, p, 0)` top-down, so a bottom-of-frame near object is
-  not classified with the top plane's depth. A 0.4-scale preview (384×256)
-  still builds the snap at the full depth size (960×640), which is the size the
-  readers index; the earlier canvas-size rebuild was the bug.
+* **Depth edges.** A 17 px, stride-2 9×9 min/max snap runs once per photo at
+  the **depth resolution** into an R16F texture; the layer, blur and final
+  `texelFetch` it instead of repeating the search seven times per frame. The
+  snap takes the min/max depth and chooses the extreme whose cluster-mean
+  colour is closest, but only when the centre sits inside the mixed band, the
+  near and far 10 % clusters each hold at least 20 % of the samples, the middle
+  holds at most 55 %, and the two cluster means differ in colour
+  (`|mn − mf|² > 0.01`). A real step has plateaus on both sides; a planar slope
+  (even textured) spreads through the middle and is left smooth. The mock now
+  has a textured 0.7–2.2 m ground plane; the snap equals the raw depth at three
+  points on it. The snap is built once per photo, not per focus tick. It is
+  stored in **photo orientation** (the FBO row is flipped once in `SNAP_FRAG`);
+  every reader indexes `texelFetch(u_depthSnap, p, 0)` top-down, so a
+  bottom-of-frame near object is not classified with the top plane's depth. A
+  0.4-scale preview (384×256) still builds the snap at the full depth size
+  (960×640), which is the size the readers index; the earlier canvas-size
+  rebuild was the bug.
 * **Prefiltered taps.** The gather reads the layer mips at
   `log2(radius * sqrt(pi / taps))`, so 96/192 taps cover a 40–280 px disc
   without the mip-0 stipple.

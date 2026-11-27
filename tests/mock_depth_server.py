@@ -37,6 +37,10 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     near = (xx - 330) ** 2 + (yy - 360) ** 2 < 130 ** 2
     small = (xx - 640) ** 2 + (yy - 500) ** 2 < 8 ** 2
     mid = (xx > 600) & (xx < 860) & (yy > 180) & (yy < 460)
+    # A steep, textured ground plane (0.7-2.2 m over 200 px) whose 9 px depth
+    # range is well above the snap threshold but which is not a discontinuity.
+    slope = (xx > 80) & (xx < 280) & (yy > 500) & (yy < 620)
+    z_slope = 0.70 + 1.50 * (xx - 80) / 200.0
 
     base = 0.32 + 0.10 * np.sin(xx / 23.0) + 0.07 * np.cos(yy / 31.0)
     img = np.stack([base * 0.82, base * 0.92, base * 1.10], axis=-1)
@@ -46,6 +50,11 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     # should be clipped, so the highlight-expansion test measures the dot.
     img[near] = np.stack([0.68 + 0.12 * tex, 0.22 + 0.40 * tex, 0.15 + 0.20 * tex], axis=-1)[near]
     img[small] = np.array([0.86, 0.58, 0.20])
+    img[slope] = np.stack([
+        0.34 + 0.18 * np.sin(xx / 5.0),
+        0.30 + 0.16 * np.cos(yy / 6.0),
+        0.26 + 0.14 * np.sin((xx + yy) / 7.0),
+    ], axis=-1)[slope]
     spec = (xx - 300) ** 2 + (yy - 320) ** 2 < 5 ** 2
     img[spec] = [1.0, 1.0, 1.0]
     img += rng.normal(0.0, 0.018, img.shape)
@@ -55,6 +64,7 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     z[mid] = 4.0
     z[near] = 1.5
     z[small] = 1.5
+    z[slope] = z_slope[slope]
     inv = (1.0 / z).astype(np.float32)
     return (img * 255.0 + 0.5).astype(np.uint8), inv
 

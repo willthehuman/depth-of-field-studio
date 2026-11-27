@@ -171,8 +171,8 @@ void main() {
   p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
   vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
   float dmin = 1e9, dmax = -1e9;
-  for (int dy = -4; dy <= 4; dy++) {
-    for (int dx = -4; dx <= 4; dx++) {
+  for (int dy = -8; dy <= 8; dy += 2) {
+    for (int dx = -8; dx <= 8; dx += 2) {
       ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
       float d = texelFetch(u_depth, q, 0).r;
       dmin = min(dmin, d);
@@ -183,23 +183,24 @@ void main() {
   float range = dmax - dmin;
   float outD = center;
 
-  // A guided ramp has real plateaus at both extremes inside the 9x9 window; a
-  // smooth slope only touches each extreme at one or two samples. Counting the
-  // cluster sizes separates them without an adjacent-jump test, which rejected
-  // the 9 px guided ramp this snap exists to remove.
+  // A real step has plateaus at both extremes; a planar slope (even textured)
+  // spreads samples through the middle. A stride-2 17 px window plus the
+  // near/middle/far proportions separates them without an adjacent-jump test.
   if (range > 0.004 && center > dmin + 0.10 * range && center < dmax - 0.10 * range) {
     vec3 cNear = vec3(0.0), cFar = vec3(0.0);
-    float nNear = 0.0, nFar = 0.0;
-    for (int dy = -4; dy <= 4; dy++) {
-      for (int dx = -4; dx <= 4; dx++) {
+    float nNear = 0.0, nFar = 0.0, nMid = 0.0;
+    for (int dy = -8; dy <= 8; dy += 2) {
+      for (int dx = -8; dx <= 8; dx += 2) {
         ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
         float d = texelFetch(u_depth, q, 0).r;
         vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
         if (d <= dmin + 0.10 * range) { cNear += c; nNear += 1.0; }
-        if (d >= dmax - 0.10 * range) { cFar += c; nFar += 1.0; }
+        else if (d >= dmax - 0.10 * range) { cFar += c; nFar += 1.0; }
+        else nMid += 1.0;
       }
     }
-    if (nNear >= 3.0 && nFar >= 3.0) {
+    float nAll = 81.0;
+    if (nNear >= 0.20 * nAll && nFar >= 0.20 * nAll && nMid <= 0.55 * nAll) {
       vec3 mn = cNear / nNear;
       vec3 mf = cFar / nFar;
       // A planar colour ramp also has many samples near both depth extremes;
