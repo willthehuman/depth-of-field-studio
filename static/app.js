@@ -161,18 +161,6 @@ out vec4 outColor;
 uniform sampler2D u_photo;
 uniform sampler2D u_depth;
 uniform vec2 u_depthSize;
-uniform float u_fpxNative;
-uniform float u_fmm;
-uniform float u_fstop;
-uniform float u_focus;
-
-float cocSnap(float d) {
-  float s = clamp(u_focus, 0.05, 4000.0);
-  float smm = s * 1000.0;
-  float mag = smm / max(smm - u_fmm, 1.0);
-  return (u_fpxNative * u_fmm / max(u_fstop, 0.7))
-       * abs(d - 1.0 / s) * 0.001 * mag;
-}
 
 void main() {
   // FBO rows are bottom-up; store the snap in photo orientation like the
@@ -193,26 +181,13 @@ void main() {
   }
   float center = texelFetch(u_depth, p, 0).r;
   float range = dmax - dmin;
-
-  // A real step in the centre's own 3x3. On a smooth guided ramp the adjacent
-  // difference is about range/8, so the ramp stays smooth instead of being
-  // terraced into the window's min/max.
-  float maxAdj = 0.0;
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      if (dx == 0 && dy == 0) continue;
-      ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
-      maxAdj = max(maxAdj, abs(center - texelFetch(u_depth, q, 0).r));
-    }
-  }
-
   float outD = center;
-  bool band = center > dmin + 0.10 * range && center < dmax - 0.10 * range;
-  // Express the threshold in CoC pixels: a 0.6 px CoC difference is visible.
-  float cocRange = abs(cocSnap(dmax) - cocSnap(dmin));
-  if (range > 0.002 && cocRange > 0.6 && maxAdj > 0.4 * range && band) {
-    // Cluster-mean colours: the mean of the texels within 10% of each
-    // extreme, not one noise-sensitive texel per extreme.
+
+  // A guided ramp has real plateaus at both extremes inside the 9x9 window; a
+  // smooth slope only touches each extreme at one or two samples. Counting the
+  // cluster sizes separates them without an adjacent-jump test, which rejected
+  // the 9 px guided ramp this snap exists to remove.
+  if (range > 0.004 && center > dmin + 0.10 * range && center < dmax - 0.10 * range) {
     vec3 cNear = vec3(0.0), cFar = vec3(0.0);
     float nNear = 0.0, nFar = 0.0;
     for (int dy = -4; dy <= 4; dy++) {
@@ -224,13 +199,15 @@ void main() {
         if (d >= dmax - 0.10 * range) { cFar += c; nFar += 1.0; }
       }
     }
-    vec3 mn = cNear / max(nNear, 1.0);
-    vec3 mf = cFar / max(nFar, 1.0);
-    float dn = dot(c0 - mn, c0 - mn);
-    float df = dot(c0 - mf, c0 - mf);
-    if (dn < df) outD = dmin;
-    else if (df < dn) outD = dmax;
-    else outD = dmax;              // exact tie: lean foreground
+    if (nNear >= 3.0 && nFar >= 3.0) {
+      vec3 mn = cNear / nNear;
+      vec3 mf = cFar / nFar;
+      float dn = dot(c0 - mn, c0 - mn);
+      float df = dot(c0 - mf, c0 - mf);
+      if (dn < df) outD = dmin;
+      else if (df < dn) outD = dmax;
+      else outD = dmax;              // exact tie: lean foreground
+    }
   }
   outColor = vec4(outD, 0.0, 0.0, 1.0);
 }`;
@@ -373,7 +350,7 @@ void main() {
   // far radius with the near max by the near alpha stops the grain switching
   // on the geometric silhouette inside a soft foreground edge.
   float farR = min(0.5 * cocDiameter(d), u_maxRadius);
-  float nearR = texelFetch(u_cocTex, ivec2(gl_FragCoord.xy) / 32, 0).r * u_infoScale;
+  float nearR = texelFetch(u_cocTex, ivec2(gl_FragCoord.x, u_res.y - gl_FragCoord.y) / 32, 0).r * u_infoScale;
   float radius = mix(farR, max(farR, nearR), a);
   float grain = smoothstep(0.75, 4.0, radius) * u_grain;
   float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
@@ -522,9 +499,9 @@ void main() {
   ivec2 t = ivec2(uv * u_tileCount);
   t = clamp(t, ivec2(0), ivec2(u_tileCount) - 1);
   float m = 0.0;
-  for (int dy = -32; dy <= 32; dy++) {
+  for (int dy = -48; dy <= 48; dy++) {
     if (abs(dy) > u_ntiles) continue;
-    for (int dx = -32; dx <= 32; dx++) {
+    for (int dx = -48; dx <= 48; dx++) {
       if (abs(dx) > u_ntiles) continue;
       ivec2 q = clamp(t + ivec2(dx, dy), ivec2(0), ivec2(u_tileCount) - 1);
       float qmax = textureLod(u_tileTex, (vec2(q) + 0.5) / u_tileCount, 0.0).r * u_infoScale;
@@ -633,9 +610,11 @@ float apertureShape(vec2 q, vec2 field, float fstop, float nearSign) {
   float cat = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, fstop));
   vec2 dir = field / max(fieldR, 1e-4);
   float clip2 = smoothstep(1.025, 0.975, length(q - dir * (0.60 * cat)));
-  // The 0.60*cat offset already carries the cat's-eye amount; mixing the clip
-  // in again applied cat twice and inflated the near alpha mid-field.
-  shape *= clip2;
+  // The 0.60*cat offset carries the cat's-eye amount, so scale the clip by cat
+  // rather than applying it unconditionally: at cat = 0 a unit clip would cut
+  // the 9-gon's 1.042 circumradius back to a near-circle. The surviving area is
+  // therefore 1 - cat + cat*catArea(cat), not catArea alone.
+  shape *= mix(1.0, clip2, cat);
 
   // Mild spherical-aberration rim: bright rim on one side of focus, soft centre
   // on the other. 2r^2 - 1 has a disc mean of zero, so the profile is genuinely
@@ -754,7 +733,7 @@ void main() {
   // Equal unit circles offset by 0.60 leave a cat-dependent fraction of the
   // aperture. Divide the coverage alpha by the exact area so a vignetted pupil
   // does not make an opaque foreground transparent at the edge.
-  float shapeArea = catArea(catDest);
+  float shapeArea = 1.0 - catDest + catDest * catArea(catDest);
   float spin = ign(gl_FragCoord.xy + vec2(float(u_layer) * 19.0, 0.0)) * TAU;
   float lod = clamp(log2(max(1.0, radius * sqrt(PI / float(u_taps)))) - 0.5, 0.0, u_maxLod);
   // Radius-stratified tap set. A destination whose own CoC is small compared
@@ -763,6 +742,7 @@ void main() {
   // at 1.07*own in that case and keep the total area at pi*R^2.
   int innerN = (own > 0.5 && own < 0.25 * radius) ? min(24, u_taps / 4) : 0;
   float rInner = 1.07 * own;
+  float lodInner = clamp(log2(max(1.0, rInner * sqrt(PI / float(max(innerN, 1))))) - 0.5, 0.0, u_maxLod);
   float aInner = innerN > 0 ? PI * rInner * rInner / float(innerN) : 0.0;
   float rOuter2 = max(radius * radius - (innerN > 0 ? rInner * rInner : 0.0), 0.0);
   float aOuter = innerN > 0
@@ -791,7 +771,8 @@ void main() {
     }
     float a = (float(i) + 0.5) * GOLDEN + spin;
     vec2 sUV = clamp(uv + vec2(cos(a), sin(a)) * r / u_res, vec2(0.0), vec2(1.0));
-    vec4 s = textureLod(u_layerTex, sUV, lod);
+    float tapLod = i < innerN ? lodInner : lod;
+    vec4 s = textureLod(u_layerTex, sUV, tapLod);
     vec3 sc = s.rgb / max(s.a, 1e-4);
     // Coverage and the source's own CoC come from mip 0, not from the
     // prefiltered level: the coarse mip would smear the layer's coverage
@@ -851,10 +832,17 @@ void main() {
     float selfRadE = max(selfRad, 0.5);
     vec3 selfCol = self0.rgb / selfCov;
     float selfShape = apertureShape(vec2(0.0), field, u_fstop, 0.0);
-    float selfW = selfShape * min(1.0, max(hole * hole, 0.25) / (selfRadE * selfRadE));
+    // Only fill the hole the tap set actually leaves. With the inner set the
+    // first tap is much closer, so an always-on self tap would double-count the
+    // centre and bias a nearly-sharp source toward its own colour.
+    float firstR = innerN > 0 ? sqrt(0.5 / float(innerN)) * rInner : hole;
+    float selfW = selfRadE < firstR
+      ? selfShape * min(1.0, (firstR * firstR) / (selfRadE * selfRadE))
+      : 0.0;
     acc += vec4(selfCol * selfCov * selfW, selfCov * selfW);
   }
-  acc = fg + acc * (1.0 - fg.a);
+  float occ = clamp(fg.a / max(shapeArea, 0.20), 0.0, 1.0);
+  acc = fg + acc * (1.0 - occ);
 
   // The scatter-as-gather alpha is the aperture coverage. With the depth snap
   // in photo orientation this is also the fraction of the destination PSF that
@@ -967,7 +955,7 @@ void main() {
       `u_tileTex`, `u_tileCount`, `u_ntiles`, `u_tile`, `u_infoScale`,
     ]);
     S.locSnap = uniformLocations(gl, S.progSnap, [
-      `u_photo`, `u_depth`, `u_depthSize`, `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`,
+      `u_photo`, `u_depth`, `u_depthSize`,
     ]);
     S.locPre.u_src = gl.getUniformLocation(S.progPre, "u_src");
     S.fbo = gl.createFramebuffer();
@@ -1125,10 +1113,6 @@ void main() {
       gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
       gl.uniform1i(S.locSnap.u_depth, 1);
       gl.uniform2f(S.locSnap.u_depthSize, w, h);
-      gl.uniform1f(S.locSnap.u_fpxNative, S.meta.f_px);
-      gl.uniform1f(S.locSnap.u_fmm, effFocal());
-      gl.uniform1f(S.locSnap.u_fstop, FSTOPS[S.fstopIdx]);
-      gl.uniform1f(S.locSnap.u_focus, S.focus);
       useQuad(S.progSnap);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
@@ -1136,6 +1120,8 @@ void main() {
     // R8 UNORM clamps every 1/z above 1 m and quantises the rest, which breaks
     // the whole split; use the raw R16F depth instead on that fallback.
     S.snapOK = ok && S.colorFloat;
+    S.snapW = w;
+    S.snapH = h;
     glError(gl, "depth snap");
     return ok;
   }
@@ -1238,7 +1224,7 @@ void main() {
 
     buildLinearTexture(targetW, targetH);
     buildRadianceTexture(targetW, targetH, true);
-    buildDepthSnap(targetW, targetH);
+    buildDepthSnap(S.depthW || targetW, S.depthH || targetH);
   }
 
   /* --------------------------------------------------------------- rendering */
@@ -1538,14 +1524,6 @@ void main() {
     if (S.radianceDirty) {
       renderRadiance();
       S.radianceDirty = false;
-    }
-    // The snap's CoC threshold depends on the lens and focus; rebuild it when
-    // they change, not only when the targets are allocated.
-    if (S.targets && S.depthW && (!S.snapLens ||
-        S.snapLens.focus !== S.focus || S.snapLens.fstop !== S.fstopIdx ||
-        S.snapLens.fmm !== effFocal())) {
-      buildDepthSnap(S.targets.w, S.targets.h);
-      S.snapLens = { focus: S.focus, fstop: S.fstopIdx, fmm: effFocal() };
     }
 
     const effMode = (S.holdOriginal && !forExport) ? 2 : S.mode;
@@ -1905,8 +1883,13 @@ void main() {
       });
     } catch (e) {
       console.error(e);
-      overlay(true, "Export failed", String(e.message || e), 100);
-      setTimeout(() => overlay(false), 4000);
+      if (S.gl.isContextLost()) {
+        overlay(true, "GPU context lost",
+          "The browser reset the GPU. Reload the page to rebuild the textures.", 100);
+      } else {
+        overlay(true, "Export failed", String(e.message || e), 100);
+        setTimeout(() => overlay(false), 4000);
+      }
     } finally {
       S.busy = false;
       $("exportBtn").disabled = false;

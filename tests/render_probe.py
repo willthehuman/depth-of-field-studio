@@ -274,6 +274,7 @@ def main() -> None:
             focus: d.S.focus, fstop: d.S.fstopIdx, lens: d.S.lensMM,
             glErr, glErrors: d.S.glErrors || 0, coin,
             meta: {{width: d.S.meta.width, height: d.S.meta.height, f_px: d.S.meta.f_px}},
+            snap: [d.S.snapW, d.S.snapH], depth: [d.S.depthW, d.S.depthH],
           }};
         }})()"""
         result = cdp.eval(js, timeout_s=420)

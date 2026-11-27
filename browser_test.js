@@ -325,9 +325,12 @@
   out.zoom.resetDiff = +meanDiff(fit, cap()).toFixed(2);
   if (out.zoom.resetDiff > 2) fail.push("double-click did not reset the zoom");
 
-  // panning must not steal click-to-focus; a plain click must still focus
+  // panning must not steal click-to-focus; a plain click must still focus,
+  // and this must hold while zoomed (the old check ran at zoom 1).
   setMode(0);
   await frame();
+  wheel(-600);
+  await frame(); await sleep(150);
   const focus0 = $("focusOut").textContent;
   drag(cx0, cy0, cx0 + 120, cy0);
   await frame();

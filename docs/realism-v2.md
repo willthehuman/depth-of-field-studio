@@ -41,25 +41,28 @@ everything else is client-side.
   foreground does not pay for a full tap set.
 * **Depth test.** A tap beyond the destination's own blur radius only counts if
   it is nearer. A blurrier background cannot paint over the midground.
-* **Depth edges.** The 9×9 min/max snap runs once per photo into an R16F
-  texture; the layer, blur and final `texelFetch` it instead of repeating the
-  search seven times per frame. The snap takes the min/max depth and chooses
-  the extreme whose cluster-mean colour is closest, but only when the centre
-  sits inside the mixed band, the centre's own 3×3 contains a real adjacent
-  jump (`> 0.4·range`), and the two extremes differ by more than 0.6 px of CoC.
-  A smooth guided ramp (adjacent difference ≈ range/8) is therefore left as a
-  smooth transition instead of being terraced; a hard step is snapped. It is
-  stored in **photo orientation** (the FBO row is flipped once in `SNAP_FRAG`);
-  every reader indexes `texelFetch(u_depthSnap, p, 0)` top-down, so a
-  bottom-of-frame near object is not classified with the top plane's depth.
+* **Depth edges.** The 9×9 min/max snap runs once per photo at the **depth
+  resolution** into an R16F texture; the layer, blur and final `texelFetch` it
+  instead of repeating the search seven times per frame. The snap takes the
+  min/max depth and chooses the extreme whose cluster-mean colour is closest,
+  but only when the centre sits inside the mixed band and the window has at
+  least three samples in **each** 10 % extreme cluster. A real step has plateaus
+  on both sides; a smooth slope only touches each extreme at one or two samples,
+  so it is left smooth instead of being terraced. The snap is built once per
+  photo, not per focus tick. It is stored in **photo orientation** (the FBO row
+  is flipped once in `SNAP_FRAG`); every reader indexes
+  `texelFetch(u_depthSnap, p, 0)` top-down, so a bottom-of-frame near object is
+  not classified with the top plane's depth. A 0.4-scale preview (384×256)
+  still builds the snap at the full depth size (960×640), which is the size the
+  readers index; the earlier canvas-size rebuild was the bug.
 * **Prefiltered taps.** The gather reads the layer mips at
   `log2(radius * sqrt(pi / taps))`, so 96/192 taps cover a 40–280 px disc
   without the mip-0 stipple.
 * **Radius-stratified taps.** When the destination's own CoC is below a quarter
   of the dilated gather radius, 24 taps form an inner disc at `1.07·own` with
-  their own area weight and the rest cover the outer annulus. Without it a
-  small-CoC source beside a large near blur got only 1–5 taps and its alpha
-  speckled.
+  their own area weight and their own (sharper) mip; the rest cover the outer
+  annulus. Without it a small-CoC source beside a large near blur got only 1–5
+  taps and its alpha speckled.
 * **Preview LOD.** The base photo reads `log2(1/u_scale)` instead of mip 0, so
   a 24 MP frame on a 1200 px canvas no longer aliases in the original view.
 * **Aperture.** A nine-blade polygon whose roundness follows the f-stop, with
@@ -75,7 +78,9 @@ everything else is client-side.
   scale. The old version read the clip mask at `baseLod`, so preview highlights
   were up to an order of magnitude dimmer than the export.
 * **Grain.** Signal-weighted (shot-noise-like) grain in blurred areas, scaled by
-  the local defocus. Exposed as a slider.
+  the **effective** defocus: the far radius mixed with the near max by the near
+  alpha, so the grain does not switch on the geometric silhouette inside a soft
+  foreground edge. Exposed as a slider.
 * **Blur cap.** The cap is now a literal 10% of the short side
   (`min(0.5 * coc, u_maxRadius)`); the old code still applied it to the
   diameter and the effective radius was 5%.
@@ -111,35 +116,35 @@ unless stated:
   renderer. Focus exactly on the near disc at 1.5 m: the 120 px near patch is
   172.7/53.6/37.1 (R/G/B) versus 172.6/53.5/37.0 for the original.
 * **Near edge.** The linear `nearBlur.a` 10–90% transition along y = 360 runs
-  x 181→227: **46 px**, within 6 % of the 49 px hard-disc (pillbox) prediction
+  x 179→229: **50 px**, within 2 % of the 49 px hard-disc (pillbox) prediction
   (1.37 R). The earlier 36 px figure was the colour transition, not the alpha;
   there is no truncation. The blur cap is not active in this frame (uncapped
   radius 35.8 px). The old colour-mip version measured ~56 px because it
   overestimated the near radius.
 * **Highlights.** A full-slider specular bokeh at focus 8 m: the 8 px core is
-  **189/105/96** in the preview (971×647) and **187/100/91** in the export
-  (960×640). Preview vs export downsampled to 960 is 0.737 / 255 mean absolute.
-* **Small object.** The 8 px near coin's 16×16 centre is now **92.4/81.8/83.0**
-  (R/G/B) against the ~80 analytic; the near layer's alpha is 0.046, the depth
+  **188/102/94** in the preview (971×647) and **186/99/89** in the export
+  (960×640). Preview vs export downsampled to 960 is 0.676 / 255 mean absolute.
+* **Small object.** The 8 px near coin's 16×16 centre is now **90.7/81.1/83.1**
+  (R/G/B) against the ~80 analytic; the near layer's alpha is 0.045, the depth
   snap reads 0.6665 (1.5 m) and the near-coverage mips read 0.595 / 0.302 /
   0.088 at levels 3/4/5. The earlier 94/187 flip-flop was the depth snap being
   written bottom-up: the coin was classified with the top plane's depth. The
   alpha is now the plain aperture coverage, and the coin's PSF sees the near
-  source for only 4.6 % of the aperture. Near/far decomposition at the coin
-  centre: near R 0.031 (premultiplied, alpha 0.046) + far R 0.072 × (1 − 0.046)
-  = 0.0997 linear ≈ 89 sRGB, with the 16×16 mean 92.4 because the patch includes
-  the brighter coin edge. The +12 codes against 80 are the near layer's own red
-  (0.716 straight × 0.046), not a far-fill error. The flat near-disc centre still
+  source for only 4.5 % of the aperture. Near/far decomposition at the coin
+  centre: near R 0.031 (premultiplied, alpha 0.045) + far R 0.072 × (1 − 0.045)
+  = 0.0998 linear ≈ 89 sRGB, with the 16×16 mean 90.7 because the patch includes
+  the brighter coin edge. The +10 codes against 80 are the near layer's own red
+  (0.716 straight × 0.045), not a far-fill error. The flat near-disc centre still
   matches the original at 172.7/172.6.
 * **Polygon.** At f/8 the per-angle specular bokeh edge radius varies 7.5–11 px
-  (std 1.06). The 9-sector mean spread is 2.62 px and the 9th angular harmonic
-  is only 0.10 px, so this 5 px source cannot isolate the 9-gon; the polygon is
+  (std 1.02). The 9-sector mean spread is 2.50 px and the 9th angular harmonic
+  is only ~0.1 px, so this 5 px source cannot isolate the 9-gon; the polygon is
   visible but this metric does not demonstrate it. The theoretical
   vertex/inradius difference is ~0.6 px at that edge.
-* **Preview vs export.** 0.737 / 255 mean absolute between the 971×647 preview
+* **Preview vs export.** 0.676 / 255 mean absolute between the 971×647 preview
   and the 960×640 export downsampled to 960, 96/192 taps, with grain on.
 * **Zoom.** A 4× centre crop vs the export's central 240×160 quarter upscaled:
-  1.51 / 255 mean absolute, max 37; the earlier 2.37 was not a like-for-like
+  1.41 / 255 mean absolute, max 35; the earlier 2.37 was not a like-for-like
   crop and is superseded.
 
 SwiftShader timings are not representative of a discrete GPU. The target is a
