@@ -2,7 +2,8 @@
 
 Implementation of the renderer corrections in
 [`opus-realism-review.md`](opus-realism-review.md), plus the PR-review fixes.
-The server and model code are unchanged; this is a client-side renderer rewrite.
+The only server change is one `torch.cuda.empty_cache()` after the estimate;
+everything else is client-side.
 
 ## Renderer
 
@@ -21,16 +22,18 @@ The server and model code are unchanged; this is a client-side renderer rewrite.
   but coverage and the source's own CoC are read from mip 0. The coarse mip
   would smear the layer's coverage outward and turn the alpha into an opaque
   average.
-* **Near radius from a true max.** A 32 px tile-max of the near CoC, dilated by a
-  whole-tile neighbour-max, replaces the coverage-weighted colour-mip probe. A
-  small very defocused object keeps its full disc; a destination far from any
+* **Near radius from a true max.** A 32 px tile-max of the near CoC plus a
+  reach-limited neighbour-max (a tile contributes only if its own CoC reaches
+  the destination tile) replaces the coverage-weighted colour-mip probe. A
+  small very defocused object keeps its full disc; a destination far from a
   foreground does not pay for a full tap set.
 * **Depth test.** A tap beyond the destination's own blur radius only counts if
   it is nearer. A blurrier background cannot paint over the midground.
-* **Depth edges.** The 3×3 lookup now excludes the centre, takes the min and max
-  depth, and snaps only when the centre sits inside the mixed band, to the
-  extreme whose colour is closest. The old loop included the centre, so the snap
-  was a no-op.
+* **Depth edges.** The 5×5 min/max snap runs once per photo into an R16F
+  texture; the layer, blur and final `texelFetch` it instead of repeating the
+  search seven times per frame. The snap takes the min/max depth and chooses
+  the extreme whose colour is closest, only when the centre sits inside the
+  mixed band.
 * **Prefiltered taps.** The gather reads the layer mips at
   `log2(radius * sqrt(pi / taps))`, so 96/192 taps cover a 40–280 px disc
   without the mip-0 stipple.
@@ -39,8 +42,9 @@ The server and model code are unchanged; this is a client-side renderer rewrite.
 * **Aperture.** A nine-blade polygon whose roundness follows the f-stop, with
   equal-radius cat's-eye clipping toward the frame edge and an energy-neutral
   spherical-aberration rim. The gather covers the polygon's circumradius
-  (1.05×), so the 9-gon is actually visible at f/4+; the old circular source
-  test clipped the vertices.
+  (1.07×, also centring the source-disc ramp), so the 9-gon is actually visible
+  at f/4+; the old circular source test clipped the vertices. The alpha is
+  divided by the exact two-circle intersection area, not a linear fit.
 * **Highlights.** A 0–5 stop expansion in a **full-resolution radiance texture**
   at mip 0, before the layer mips average the colour. The isolation gate is the
   mip-5 clip fraction; the layer mixes the radiance in by the pixel's own blur
@@ -94,9 +98,12 @@ unless stated:
   147.7 (R) when defocused at focus 8 m and spreads over the expected ~35 px
   disc; the tile max keeps the full disc instead of truncating it.
 * **Polygon.** At f/8 the specular bokeh edge radius varies 7.5–11 px around the
-  disc (std 1.04) — the 9-gon is visible; at f/1.4 it is round.
-* **Preview vs export (no highlight test).** 0.79 / 255 mean absolute between
-  the 971×647 preview and 960×640 export at 96/192 taps.
+  disc; the 1.04 px std includes tap and 5 px source noise. The theoretical
+  circumradius/inradius spread is ±0.35 px at that edge; measure the 9th angular
+  harmonic if you need to separate the polygon from tap noise. At f/1.4 it is
+  round.
+* **Preview vs export (no highlight test).** 0.85 / 255 mean absolute between
+  the 971×647 preview and 960×640 export at 96/192 taps with grain on.
 * **Zoom.** The previous 4× crop vs export crop measurement was 2.37 / 255
   mean absolute; not re-run after the review fixes.
 

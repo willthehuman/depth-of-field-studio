@@ -72,11 +72,12 @@ float32. Inference peaks at 3.96 GB at 1280 px, 4.9 GB at 1536 px
 
 The two-field renderer keeps four canvas-sized float layer textures plus their
 mips, two blur targets, the full-resolution linear photo and the full-resolution
-radiance texture. At 24 MP that is roughly 2 GB of export buffers. The model and
-the exporter do not peak at the same time, so 24 MP is tight on the 6 GB target;
-8 GB is the comfortable figure. An 8192 px export can exceed it. The export is
-drawn in 512-row bands with a flush between draws to stay under the Windows TDR
-limit.
+radiance texture. At 24 MP that is roughly 2 GB of export buffers. `app.py`
+releases the transient H+ activations with `torch.cuda.empty_cache()` after the
+estimate, but the 3.3 GB of weights stay resident, so 24 MP is tight on the 6 GB
+target; 8 GB is the comfortable figure. An 8192 px export can exceed it. The
+export is drawn in 512-row bands with a flush between draws to stay under the
+Windows TDR limit.
 
 ## Layout
 

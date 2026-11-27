@@ -280,6 +280,11 @@ def estimate(image_path: Path, side: int) -> dict:
     # Metres are only for the UI range/percentiles; the stored texture is 1/z.
     depth_full = disparity_to_metres(inv_full)
 
+    # Release the transient H+ activations from the caching allocator before the
+    # browser starts a 24 MP export; the live depth tensor is unaffected.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     sample = depth_full[:: max(1, h // 400), :: max(1, w // 400)]
     pct = np.percentile(sample, [0.5, 5, 50, 95, 99.5])
     focal35 = focal35_from_fpx(f_px_full, w, h)
