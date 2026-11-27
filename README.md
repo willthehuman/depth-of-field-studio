@@ -69,7 +69,7 @@ checkpoint is a 3.5 GB float32 download; the app builds the model on the CPU,
 casts the encoder and decoder to bf16 (they only ever run under bf16 autocast
 anyway) and keeps the depth head and focal estimator in float32. The resident
 encoder/decoder is about 1.8 GB. Inference peaks at 3.96 GB at 1280 px on the
-12 GB card; 4.9 GB at 1536 px (`python3 probe_sizes.py`, not re-run here; `set DEPTH_SIDE=1536` to try it). A 5656×4242
+12 GB card; `probe_sizes.py` reports the cost of a 1536 px inference size (`set DEPTH_SIDE=1536` to try it; not re-run here). A 5656×4242
 photo analysed in 3.1 s (standalone backend) and exported in 4.0 s wall; tiled
 and non-tiled exports are pixel-identical. `nvidia-smi` sampled 2.8 GiB total
 during the export, but the texture accounting plus the resident model is about
