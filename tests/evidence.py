@@ -145,6 +145,8 @@ def main() -> None:
     mask = grad >= np.percentile(grad, 90)
     d_scale_edge = d_scale.mean(axis=2)[mask].mean()
 
+    ramp_snap = sum(1 for _, raw, snap in c['ramp'] if abs(raw - snap) > 1e-4)
+    ramp_total = len(c['ramp'])
     near = c["nearAlpha"]
     near_rows = [a for x, y, a in near if y <= 209]
     near_rect = [a for x, y, a in near if y == 300 and x >= 620]
@@ -178,7 +180,7 @@ own mock server on port {PORT}.
 | Coin snap depth (source 640,500) | {c['depth500'][0]:.4f} |
 | Near mips 3/4/5 | {[round(c['nearMip3'][3], 3), round(c['nearMip4'][3], 3), round(c['nearMip5'][3], 3)]} |
 | Textured 0.7-2.2 m slope | snap != raw {c['slopeDiff'][0]}/{c['slopeDiff'][1]}; samples {c['slope']} |
-| 9 px 2-4 m ramp | snap != raw {c['rampDiff'][0]}/{c['rampDiff'][1]}; 6/9 at y=590; samples {c['ramp']} |
+| 9 px 2-4 m ramp | snap != raw {c['rampDiff'][0]}/{c['rampDiff'][1]}; {ramp_snap}/{ramp_total} at y=590; samples {c['ramp']} |
 | Polygon edge | {vals.min():.2f}-{vals.max():.2f} px, std {vals.std():.2f}, 9th harmonic {a9:.2f} |
 | Tiled vs non-tiled export | {d_notile.mean():.4f} mean, {d_notile.max():.1f} max |
 | 4x zoom vs export quarter | {d_zoom.mean():.3f} mean, {d_zoom.max():.1f} max |

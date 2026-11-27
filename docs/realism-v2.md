@@ -27,8 +27,7 @@ everything else is client-side.
   weight floor, a near pixel whose CoC is below 0.5 px had an expected alpha of
   `4·srad²` — near content just in front of the focus plane went 20–80 %
   transparent to the far fill (rows 165–191 of the mock read 0.21–0.98). The
-  0.5 px floor and the 24-tap inner set cover that case; the same rows read
-  six sampled rows read 0.96–1.0 and the 4 m rectangle reads 1.0. An always-on self tap was
+  0.5 px floor and the 24-tap inner set cover that case; the six sampled rows read 0.96–1.0 and the 4 m rectangle reads 1.0. An always-on self tap was
   removed after it proved unreachable (`selfRadE >= firstR` in every branch).
 * **Near-over-near ordering.** Taps whose source is nearer than the destination
   (`sd > d`) go to a separate `fg` bucket. The occlusion is normalised,
@@ -54,8 +53,8 @@ everything else is client-side.
   (even textured) spreads through the middle and is left smooth. The mock now
   has a textured 0.7–2.2 m ground plane (snap equals raw depth at three points)
   and a 9 px 2–4 m ramp with plateaus. On the ramp, six of the nine samples
-  snap to a plateau at y = 590, and 146 of 270 ramp pixels change overall: one
-  edge pixel per row remains mixed and the row ends do not snap. The snap
+  snap to a plateau at y = 590, and 146 of 270 ramp pixels change overall: about two
+  mixed pixels per interior row remain and the row ends do not snap. The snap
   reduces a guided outline but does not erase every mixed pixel. It is built once per photo, not
   per focus tick. It is
   stored in **photo orientation** (the FBO row is flipped once in `SNAP_FRAG`);
@@ -82,7 +81,8 @@ everything else is client-side.
   `mix(1, clip2, cat)` left a translucent `1−cat` crescent instead of a
   geometric clip. An energy-neutral spherical-aberration rim is added after.
   The gather covers the polygon's circumradius (1.07×, also centring the
-  source-disc ramp), so the 9-gon is visible at f/4+. The alpha is divided by
+  source-disc ramp); the 9-gon is visible in the comparison sheet, though this
+  edge metric cannot isolate it. The alpha is divided by
   the exact two-circle intersection area `catArea2(1, rc, 0.60·cat)/π`, not a
   linear fit.
 * **Highlights.** A 0–5 stop expansion in a **full-resolution radiance texture**

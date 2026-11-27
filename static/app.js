@@ -1109,7 +1109,10 @@ void main() {
       gl.uniform1i(S.locSnap.u_depth, 1);
       gl.uniform2f(S.locSnap.u_depthSize, w, h);
       useQuad(S.progSnap);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      // The snap is ~160-240 depth/photo fetches per pixel; at 24 MP a single
+      // draw is 2-3x the 2 MP band budget the export gather uses. Scissor it
+      // into the same <=2 MP bands so a mid-range Windows driver cannot hit TDR.
+      drawFullscreen(true, w, h);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     // R8 UNORM clamps every 1/z above 1 m and quantises the rest, which breaks
