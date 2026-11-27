@@ -477,8 +477,11 @@ void main() {
       ivec2 q = clamp(t + ivec2(dx, dy), ivec2(0), ivec2(u_tileCount) - 1);
       float qmax = textureLod(u_tileTex, (vec2(q) + 0.5) / u_tileCount, 0.0).r * u_infoScale;
       // Only dilate into tiles whose own CoC can actually reach this one.
-      float box = max(abs(float(dx)), abs(float(dy))) * u_tile;
-      if (box <= qmax) m = max(m, qmax);
+      // Measure the gap between the tiles, not their centres: adjacent tiles
+      // are 1 px apart, not u_tile. Without this any CoC below 32 px loses its
+      // neighbour max and the near halo is cut on the tile grid.
+      float gap = max(max(abs(float(dx)), abs(float(dy))) - 1.0, 0.0) * u_tile;
+      if (gap <= qmax * 1.12) m = max(m, qmax);
     }
   }
   outColor = vec4(m / u_infoScale, 0.0, 0.0, 1.0);
@@ -577,8 +580,10 @@ float apertureShape(vec2 q, float srad, vec2 field, float fstop, float nearSign)
   float fieldR = length(field);
   float cat = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, fstop));
   vec2 dir = field / max(fieldR, 1e-4);
-  float clip2 = smoothstep(1.0, 0.95, length(q - dir * (0.60 * cat)));
-  shape *= mix(1.0, clip2, cat);
+  float clip2 = smoothstep(1.025, 0.975, length(q - dir * (0.60 * cat)));
+  // The 0.60*cat offset already carries the cat's-eye amount; mixing the clip
+  // in again applied cat twice and inflated the near alpha mid-field.
+  shape *= clip2;
 
   // Mild spherical-aberration rim: bright rim on one side of focus, soft centre
   // on the other. 2r^2 - 1 has a disc mean of zero, so the profile is genuinely
@@ -652,7 +657,7 @@ void main() {
   float fillLod = 0.0;
   bool fillFound = false;
   if (u_layer == 1) {
-    for (int probe = 0; probe < 12; probe++) {
+    for (int probe = 0; probe <= 12; probe++) {
       float lod = min(float(probe), u_maxLod);
       vec4 probeCol = textureLod(u_layerTex, uv, lod);
       if (probeCol.a > 0.02) {
@@ -672,9 +677,9 @@ void main() {
   // defocused foreground.
   float radius;
   if (u_layer == 1) {
-    radius = min(max(own, fill) * 1.07, u_maxRadius);
+    radius = min(max(own, fill) * 1.07, u_maxRadius * 1.07);
   } else {
-    radius = min(max(own, nearMax) * 1.07, u_maxRadius);
+    radius = min(max(own, nearMax) * 1.07, u_maxRadius * 1.07);
   }
 
   if (radius < 0.55) {
@@ -750,13 +755,15 @@ void main() {
   // the destination's own mip-0 sample as a self tap only for that small-CoC
   // case; an extended defocused source must be built from the surrounding taps.
   vec4 self0 = textureLod(u_layerTex, uv, 0.0);
-  if (self0.a > 0.02 && own < radius / sqrt(float(u_taps))) {
+  if (self0.a > 0.02 && own < sqrt(0.5 / float(u_taps)) * radius) {
     float selfCov = self0.a;
     float selfRad = textureLod(u_infoTex, uv, 0.0).r * u_infoScale / selfCov;
     vec3 selfCol = self0.rgb / selfCov;
     float selfShape = apertureShape(vec2(0.0), selfRad, field, u_fstop,
                                      u_layer == 0 ? 1.0 : -1.0);
-    float selfW = selfShape * A / (PI * max(selfRad * selfRad, 0.25));
+    // One source pixel, not a tap area of A: the A scale made the self tap ~50x
+    // too heavy and cut foreground bokeh behind small-CoC near pixels.
+    float selfW = selfShape * min(1.0, 1.0 / (PI * max(selfRad * selfRad, 0.25)));
     acc += vec4(selfCol * selfCov * selfW, selfCov * selfW);
   }
 
@@ -1032,7 +1039,9 @@ void main() {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    S.snapOK = ok;
+    // R8 UNORM clamps every 1/z above 1 m and quantises the rest, which breaks
+    // the whole split; use the raw R16F depth instead on that fallback.
+    S.snapOK = ok && S.colorFloat;
     glError(gl, "depth snap");
     return ok;
   }
@@ -1192,7 +1201,9 @@ void main() {
     const targets = {
       w, h, levels,
       maxLod: levels - 1,
-      infoScale: S.colorFloat ? 1 : Math.max(1, Math.min(w, h) * 0.20 * S.zoom),
+      // No zoom here: targets are cached by size, so a frozen zoom scale clamps
+      // every radius above it after the user zooms in.
+      infoScale: S.colorFloat ? 1 : Math.max(1, Math.min(w, h) * 0.20),
       tile, tileW, tileH,
       nearColour: makeTargetTexture(colourFormat, w, h, levels, true),
       farColour: makeTargetTexture(colourFormat, w, h, levels, true),
@@ -1755,6 +1766,7 @@ void main() {
       canvas.width = prevW;
       canvas.height = prevH;
       S.exporting = false;
+      releaseTargets();   // don't keep ~1 GB of export-size targets alive
       layout();
       updateZoomUI();
     }
