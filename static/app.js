@@ -146,12 +146,11 @@ void main() {
 }`;
 
   // Snap the guided filter's mixed-depth ramp once per photo, at the depth
-  // resolution, with a 9x9 window. The gathers then read a single R16F texture
-  // instead of running the search in seven passes per frame. The window must be
-  // A 17 px, stride-2 window covers the guided filter's ramp (about 9 px at
-  // 24 MP); the old 5x5 window turned it into a staircase. Snapping also
-  // requires near/middle/far proportions and a colour edge, so a textured
-  // planar slope is left alone.
+  // resolution. The gathers then read a single R16F texture instead of running
+  // the search in seven passes per frame. A 17 px, stride-2 9x9 window covers
+  // the ramp (about 9 px at 24 MP); the old 5x5 window turned it into a
+  // staircase. Snapping also requires near/middle/far proportions and a colour
+  // edge, so a textured planar slope is left alone.
   const SNAP_FRAG = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -284,7 +283,7 @@ float baseLod() {
 }
 
 // Depth lookup with the 17 px stride-2 nearest-colour snap. The guided filter leaves a
-// 2-4 px ramp of mixed 1/z at a silhouette; bilinear reads of that ramp paint
+// ~9 px ramp of mixed 1/z at a silhouette; bilinear reads of that ramp paint
 // a sharp outline when it crosses the focus plane. Take the neighbour whose
 // colour is closest to the centre instead, and break ties towards the foreground.
 float depthAt(vec2 puv) {
@@ -471,8 +470,9 @@ void main() {
   t = clamp(t, ivec2(0), ivec2(u_tileCount) - 1);
   vec2 origin = vec2(t) * u_tile;
   float maxR = 0.0;
-  for (int y = 0; y < 32; y++) {
-    for (int x = 0; x < 32; x++) {
+  int ts = int(u_tile);
+  for (int y = 0; y < ts; y++) {
+    for (int x = 0; x < ts; x++) {
       vec2 p = (origin + vec2(float(x), float(y)) + 0.5) / u_res;
       vec4 s = textureLod(u_layerTex, p, 0.0);
       if (s.a > 0.02) {
@@ -653,8 +653,8 @@ vec3 fillColour(vec2 uv, float frad, float fillLod) {
   vec4 m1 = textureLod(u_layerTex, uv, min(fillLod + 1.0, u_maxLod));
   float wa = m0.a + m1.a;
   if (wa > 0.02) return (m0.rgb + m1.rgb) / wa;
-  vec4 all = textureLod(u_layerTex, vec2(0.5), u_maxLod);
-  if (all.a > 0.01) return all.rgb / all.a;
+  vec4 fill = textureLod(u_layerTex, vec2(0.5), u_maxLod);
+  if (fill.a > 0.01) return fill.rgb / fill.a;
   return textureLod(u_photo, zoomUV(uv), baseLod()).rgb;
 }
 

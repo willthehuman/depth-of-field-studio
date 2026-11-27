@@ -46,7 +46,7 @@ launches take ~12 s to build the model on the CPU and hand it to the GPU.
 
 | | |
 |---|---|
-| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. ~1.5–2.5 s for a photo, ~4 s for a 27 MP one (standalone analysis; the 3.96 GB peak is before the refine pass). The DOF gathers fetch depth with nearest sampling and a min/max nearest-colour snap, so the filter's ~9 px mixed-depth ramp cannot paint a sharp outline when it crosses the focus plane. |
+| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. ~1.5–2.5 s for a photo, 3.11 s for 5656×4242 (24 MP, standalone `test_backend.py`; the 3.96 GB peak is before the refine pass). The DOF gathers fetch depth with nearest sampling and a min/max nearest-colour snap, so the filter's ~9 px mixed-depth ramp is reduced by the snap, but one mixed pixel per row remains and the ramp ends do not snap. |
 | **Focus** | Slider, *Auto* (median of the centre), *Centre*, or click anywhere in the photo. Distances are in metres, straight from the model. |
 | **Aperture** | f/1.0 → f/22 in third stops. |
 | **Lens** | *Native* uses the focal length the model estimates; 50/85/135 mm simulate a longer lens, which is how you get a portrait look out of a wide-angle frame. |
@@ -69,7 +69,7 @@ checkpoint is a 3.5 GB float32 download; the app builds the model on the CPU,
 casts the encoder and decoder to bf16 (they only ever run under bf16 autocast
 anyway) and keeps the depth head and focal estimator in float32. The resident
 encoder/decoder is about 1.8 GB. Inference peaks at 3.96 GB at 1280 px on the
-12 GB card; 4.9 GB at 1536 px (`set DEPTH_SIDE=1536` to try it). A 5656×4242
+12 GB card; 4.9 GB at 1536 px (`python3 probe_sizes.py`; `set DEPTH_SIDE=1536` to try it). A 5656×4242
 photo analysed in 3.1 s (standalone backend) and exported in 4.0 s wall; tiled
 and non-tiled exports are pixel-identical. `nvidia-smi` sampled 2.8 GiB total
 during the export, but the texture accounting plus the resident model is about

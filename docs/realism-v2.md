@@ -17,7 +17,7 @@ everything else is client-side.
   premultiplied colour; the final pass is Porter-Duff `over`
   (`n.rgb + f.rgb * (1 - n.a)`). The old mix of premultiplied early-outs and
   straight gather colours darkened an in-focus subject to 0.75× linear; the
-  flat-disc test now matches the original to 173.3/55.8/38.2 code values (20×20 patch); the original is 172.5/52.9/36.6.
+  flat-disc test now matches the original exactly at 172.5/52.9/36.6 in the 960×640 export (40×40 patch).
 * **Coverage alpha from mip 0.** The colour is prefiltered to the tap spacing,
   but coverage and the source's own CoC are read from mip 0. The coarse mip
   would smear the layer's coverage outward and turn the alpha into an opaque
@@ -28,7 +28,7 @@ everything else is client-side.
   `4·srad²` — near content just in front of the focus plane went 20–80 %
   transparent to the far fill (rows 165–191 of the mock read 0.21–0.98). The
   0.5 px floor and the 24-tap inner set cover that case; the same rows read
-  0.96–1.0 and the 4 m rectangle reads 1.0. An always-on self tap was
+  six sampled rows read 0.96–1.0 and the 4 m rectangle reads 1.0. An always-on self tap was
   removed after it proved unreachable (`selfRadE >= firstR` in every branch).
 * **Near-over-near ordering.** Taps whose source is nearer than the destination
   (`sd > d`) go to a separate `fg` bucket. The occlusion is normalised,
@@ -54,8 +54,9 @@ everything else is client-side.
   (even textured) spreads through the middle and is left smooth. The mock now
   has a textured 0.7–2.2 m ground plane (snap equals raw depth at three points)
   and a 9 px 2–4 m ramp with plateaus. On the ramp, six of the nine samples
-  snap to a plateau and one edge pixel remains mixed; the snap reduces a guided
-  outline but does not erase every mixed pixel. It is built once per photo, not
+  snap to a plateau at y = 590, and 146 of 270 ramp pixels change overall: one
+  edge pixel per row remains mixed and the row ends do not snap. The snap
+  reduces a guided outline but does not erase every mixed pixel. It is built once per photo, not
   per focus tick. It is
   stored in **photo orientation** (the FBO row is flipped once in `SNAP_FRAG`);
   every reader indexes `texelFetch(u_depthSnap, p, 0)` top-down, so a
@@ -126,8 +127,8 @@ unless stated:
   original. The earlier 971×647 preview comparison showed 0.108 mean and up to
   57 codes at the clipped specular because result mode resamples in linear light
   while original mode resamples in sRGB; that was a harness artefact, not the
-  renderer. Focus exactly on the near disc at 1.5 m: the 120 px near patch is
-  173.3/55.8/38.2 (R/G/B) versus 172.5/52.9/36.6 for the original; the G/B gap is ~3/255.
+  renderer. Focus exactly on the near disc at 1.5 m: the 40×40 near patch is
+  172.5/52.9/36.6 (R/G/B), identical to the original 172.5/52.9/36.6 in the 960×640 export.
 * **Near edge.** The linear `nearBlur.a` 10–90% transition along y = 360 runs
   x 181→229: **48 px**, within 2 % of the 49 px hard-disc (pillbox) prediction
   (1.37 R). The earlier 36 px figure was the colour transition, not the alpha;
@@ -137,7 +138,7 @@ unless stated:
 * **Highlights.** A full-slider specular bokeh at focus 8 m: the 8 px core is
   **188/102/94** in the preview (971×647) and **186/99/89** in the export
   (960×640). Preview vs export downsampled to 960 is 0.712 / 255 mean absolute.
-* **Small object.** The 8 px near coin's 16×16 centre is now **83.6/81.2/89.7**
+* **Small object.** The 8 px near coin's 16×16 centre is now **90.6/81.1/83.1**
   (R/G/B) against the ~80 analytic; the near layer's alpha is 0.045, the depth
   snap reads 0.6665 (1.5 m) and the near-coverage mips read 0.595 / 0.302 /
   0.088 at levels 3/4/5. The earlier 94/187 flip-flop was the depth snap being
@@ -145,10 +146,10 @@ unless stated:
   alpha is now the plain aperture coverage, and the coin's PSF sees the near
   source for only 4.5 % of the aperture. Near/far decomposition at the coin
   centre: near R 0.031 (premultiplied, alpha 0.045) + far R 0.072 × (1 − 0.045)
-  = 0.0998 linear ≈ 89 sRGB, with the 16×16 mean 90.7 because the patch includes
+  = 0.0998 linear ≈ 89 sRGB, with the 16×16 mean 90.6 because the patch includes
   the brighter coin edge. The +10 codes against 80 are the near layer's own red
-  (0.716 straight × 0.045), not a far-fill error. The flat near-disc centre still
-  matches the original at 173.3/172.5.
+  (0.676 straight × 0.045), not a far-fill error. The flat near-disc centre still
+  matches the original at 172.5/172.5.
 * **Polygon.** At f/8 the per-angle specular bokeh edge radius varies 7.5–11 px
   (std 1.02). The 9th angular harmonic
   is 0.18 px, so this 5 px source cannot isolate the 9-gon; the polygon is
@@ -166,11 +167,11 @@ On an RTX 4070 SUPER (12 GB), with the real Depth Pro 2 H+ weights and the real
 client (not the mock):
 
 - Model load 9.2 s warm; 1920×1440 analysis 0.70 s; 5656×4242 standalone
-  `test_backend.py` analysis 3.11 s (the app reports 1.3 s for the same job);
+  `test_backend.py` analysis 3.11 s (the app's 1.3 s is a cached meta value, not a measurement);
   inference 0.76 s, refine 0.14 s. The reported 3.96 GB peak is read before
   `guided_upsample`; the refine pass is not separately sampled.
-- 5656×4242 export: 21.9 MB PNG, 4.0 s wall including browser startup and
-  analysis; tiled vs non-tiled **0.000 / 0.0**. `nvidia-smi` sampled 2.8 GiB
+- 5656×4242 export: 21.9 MB PNG, 4.0 s wall with a **cached** analysis;
+  the cold standalone analysis is 3.11 s; tiled vs non-tiled **0.000 / 0.0**. `nvidia-smi` sampled 2.8 GiB
   total during the export, but the texture accounting plus the resident model
   is about 3.7 GB; the 6 GB fit is not measured.
 - `cdp_test.py` browser suite against the real model server: **ok: true**, no

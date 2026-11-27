@@ -266,8 +266,8 @@ def main() -> None:
               depth500: read(d.S.tex.depthSnap, 640, 500),
               depth100: read(d.S.tex.depthSnap, 640, 100),
               depth360: read(d.S.tex.depthSnap, 330, 360),
-              coinPixel: read(d.S.targets.nearBlur, 640, 500),
-              coinFar: read(d.S.targets.farBlur, 640, 500),
+              coinPixel: read(d.S.targets.nearBlur, 647, 506),
+              coinFar: read(d.S.targets.farBlur, 647, 506),
               slope: [[120, 520], [200, 560], [270, 610]].map(([x, y]) => [
                 x, y, +read(d.S.tex.depth, x, y)[0].toFixed(5),
                 +read(d.S.tex.depthSnap, x, y)[0].toFixed(5),

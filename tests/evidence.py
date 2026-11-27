@@ -62,7 +62,7 @@ def main() -> None:
     r("coin", ["--focus", "8", "--fstop", "3", "--lens", "135", "--taps", "96",
                "--highlight", "0.4", "--grain", "0", "--coin-debug"])
     r("flat", ["--focus", "1.5", "--mode", "0", "--taps", "96",
-               "--highlight", "0", "--grain", "0"])
+               "--highlight", "0", "--grain", "0", "--export"])
     r("hl_preview", ["--focus", "8", "--mode", "0", "--taps", "96",
                      "--highlight", "1", "--grain", "0"])
     r("hl_export", ["--focus", "8", "--mode", "0", "--taps", "192",
@@ -169,15 +169,16 @@ own mock server on port {PORT}.
 | Original flat patch (960 export, mode 2) | {center(orig, 330, 360, 20).round(1).tolist()} |
 | `blur = 0`, 960x640 export vs original | mean {d_b0.mean():.3f}, max {d_b0.max():.1f} |
 | Near alpha edge, 10-90% | {x90 - x10} px (x {x10}->{x90}) |
-| Near alpha rows 0-209 | {min(near_rows):.3f} to {max(near_rows):.3f} |
+| Near alpha sample rows | {min(near_rows):.3f} to {max(near_rows):.3f} (six samples) |
 | Near alpha 4 m rectangle | {min(near_rect):.3f} to {max(near_rect):.3f} |
 | Highlight core | {hlp[293:353, 273:333].max(axis=(0, 1)).astype(int).tolist()} preview / {hle[290:350, 270:330].max(axis=(0, 1)).astype(int).tolist()} export |
 | Preview vs export (960) | {d_prev.mean():.3f} / 255 mean, p99 {np.percentile(d_prev, 99):.2f} |
-| 8 px coin, 16x16 centre | {center(L(coin_png), 640, 500, 8).round(1).tolist()} |
-| Coin at (640, 500): near / far | near {[round(v, 4) for v in c['coinPixel']]}, far {[round(v, 4) for v in c['coinFar']]} |
-| Coin snap depth | {c['depth500'][0]:.4f} |
-| Textured 0.7-2.2 m slope | raw == snap at {len(c['slope'])} points; snap != raw {c['slopeDiff'][0]}/{c['slopeDiff'][1]} |
-| 9 px 2-4 m ramp | snap != raw {c['rampDiff'][0]}/{c['rampDiff'][1]}; samples {c['ramp']} |
+| 8 px coin, 16x16 centre | {center(L(coin_png), 647, 506, 8).round(1).tolist()} |
+| Coin at (647, 506): near / far | near {[round(v, 4) for v in c['coinPixel']]}, far {[round(v, 4) for v in c['coinFar']]} |
+| Coin snap depth (source 640,500) | {c['depth500'][0]:.4f} |
+| Near mips 3/4/5 | {[round(c['nearMip3'][3], 3), round(c['nearMip4'][3], 3), round(c['nearMip5'][3], 3)]} |
+| Textured 0.7-2.2 m slope | snap != raw {c['slopeDiff'][0]}/{c['slopeDiff'][1]}; samples {c['slope']} |
+| 9 px 2-4 m ramp | snap != raw {c['rampDiff'][0]}/{c['rampDiff'][1]}; 6/9 at y=590; samples {c['ramp']} |
 | Polygon edge | {vals.min():.2f}-{vals.max():.2f} px, std {vals.std():.2f}, 9th harmonic {a9:.2f} |
 | Tiled vs non-tiled export | {d_notile.mean():.4f} mean, {d_notile.max():.1f} max |
 | 4x zoom vs export quarter | {d_zoom.mean():.3f} mean, {d_zoom.max():.1f} max |
@@ -197,7 +198,7 @@ runs:
 
 ```bash
 python3 tests/render_probe.py --out /tmp/c.png --focus 8 --fstop 3 --lens 135 --taps 96 --highlight 0.4 --grain 0 --coin-debug
-python3 tests/render_probe.py --out /tmp/f.png --focus 1.5 --taps 96 --highlight 0 --grain 0
+python3 tests/render_probe.py --out /tmp/f.png --focus 1.5 --taps 96 --highlight 0 --grain 0 --export
 python3 tests/render_probe.py --out /tmp/e.png --focus 8 --taps 192 --highlight 0.4 --grain 0.3 --export
 python3 tests/render_probe.py --out /tmp/x.png --focus 8 --taps 192 --highlight 0.4 --grain 0.3 --export --no-tile
 python3 tests/render_probe.py --out /tmp/z.png --focus 8 --taps 96 --highlight 0.4 --grain 0 --zoom 4 --cx 0.5 --cy 0.5
