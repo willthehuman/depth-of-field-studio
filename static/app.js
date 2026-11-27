@@ -46,15 +46,24 @@
     progFinal: null,
     progLayer: null,
     progBlur: null,
+    progRad: null,
+    progTile: null,
+    progNeigh: null,
     locPre: {},
     locFinal: {},
     locLayer: {},
     locBlur: {},
+    locRad: {},
+    locTile: {},
+    locNeigh: {},
     fbo: null,
     linearOK: false,
+    radianceOK: false,
+    radianceW: 0,
+    radianceH: 0,
     colorFloat: false,
     maxExport: 8192,
-    tex: { photo: null, depth: null, linear: null },
+    tex: { photo: null, depth: null, linear: null, radiance: null },
     targets: null,
     dirty: false,
     busy: false,
@@ -96,6 +105,30 @@ void main() {
   vec3 c = srgbToLinear(texture(u_src, uv).rgb);
   float clipped = smoothstep(0.90, 0.995, max(c.r, max(c.g, c.b)));
   outColor = vec4(c, clipped);
+}`;
+
+  // Expand clipped highlights at mip 0, before the mip pyramid averages the
+  // colour. The layer pass mixes this texture in by the pixel's own blur
+  // radius, so preview and export carry the same highlight energy at every
+  // scale. Isolation still uses a mip-5 local clip fraction; the expansion
+  // itself is full-resolution.
+  const RADIANCE_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_lin;
+uniform float u_hlStops;
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  vec4 s = textureLod(u_lin, uv, 0.0);
+  float localClip = textureLod(u_lin, uv, 5.0).a;
+  float iso = 1.0 - smoothstep(0.15, 0.6, localClip);
+  vec3 c = s.rgb * exp2(u_hlStops * s.a * iso);
+  outColor = vec4(c, s.a);
 }`;
 
   // The final pass doubles as the original/depth preview. In DOF mode the
@@ -168,21 +201,28 @@ float depthAt(vec2 puv) {
   ivec2 p = ivec2(clamp(puv, 0.0, 1.0) * u_depthSize);
   p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
   vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
-  float bestD = texelFetch(u_depth, p, 0).r;
-  float bestDist = 1e9;
+  float dmin = 1e9, dmax = -1e9, cmin = 1e9, cmax = 1e9;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
+      if (dx == 0 && dy == 0) continue;
       ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
       vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
       float dist = dot(c0 - c, c0 - c);
       float d = texelFetch(u_depth, q, 0).r;
-      if (dist < bestDist - 1e-7 || (abs(dist - bestDist) <= 1e-7 && d > bestD)) {
-        bestDist = dist;
-        bestD = d;
-      }
+      if (d < dmin) { dmin = d; cmin = dist; }
+      if (d > dmax) { dmax = d; cmax = dist; }
     }
   }
-  return bestD;
+  float center = texelFetch(u_depth, p, 0).r;
+  float range = dmax - dmin;
+  // Only snap when the centre sits inside the mixed band. A solid near/far
+  // pixel is already at one extreme; leaving it alone avoids flattening slopes.
+  if (range > 0.01 && center > dmin + 0.15 * range && center < dmax - 0.15 * range) {
+    if (cmin < cmax) return dmin;
+    if (cmax < cmin) return dmax;
+    return dmax;                       // exact tie: lean foreground
+  }
+  return center;
 }
 
 float hash12(vec2 p) {
@@ -236,18 +276,21 @@ void main() {
   vec4 n = texture(u_near, v_uv);
   vec4 f = texture(u_far, v_uv);
   float a = clamp(n.a, 0.0, 1.0);
-  vec3 col = n.rgb * a + f.rgb * (1.0 - a);
+  // Both layers are premultiplied: the gather writes colour*coverage and the
+  // far plane is opaque (alpha 1). Porter-Duff "over" in premultiplied space.
+  vec3 col = n.rgb + f.rgb * (1.0 - a);
 
   // Grain: sensor noise is added after the lens, so it stays sharp in the
   // source. The synthetic blur averages it out; put a matching amount back
-  // only where the blur is strong, with a shadow-weighted amplitude.
-  float radius = 0.5 * min(cocDiameter(d), u_maxRadius);
+  // only where the blur is strong. Amplitude grows with signal (shot noise),
+  // the opposite of a constant-amplitude shadow lift.
+  float radius = min(0.5 * cocDiameter(d), u_maxRadius);
   float grain = smoothstep(0.75, 4.0, radius) * u_grain;
   float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
   float n1 = hash12(gl_FragCoord.xy);
   float n2 = hash12(gl_FragCoord.xy + vec2(17.0, 31.0));
   col += vec3((n1 - 0.5), (n1 - 0.5) * 0.7, (n2 - 0.5)) * grain
-       * (0.35 + 0.65 * (1.0 - clamp(luma, 0.0, 1.0)));
+       * (0.25 + 0.75 * sqrt(clamp(luma, 0.0, 1.0)));
 
   outColor = vec4(encode(col), 1.0);
 }`;
@@ -265,6 +308,7 @@ in vec2 v_uv;
 out vec4 outColor;
 
 uniform sampler2D u_photo;
+uniform sampler2D u_radiance;
 uniform sampler2D u_depth;
 uniform vec2 u_depthSize;
 uniform float u_fpxNative;
@@ -274,7 +318,6 @@ uniform float u_focus;
 uniform float u_scale;
 uniform float u_blur;
 uniform float u_maxRadius;
-uniform float u_hlStops;
 uniform float u_infoScale;
 uniform int u_layer;
 uniform int u_info;
@@ -304,21 +347,28 @@ float depthAt(vec2 puv) {
   ivec2 p = ivec2(clamp(puv, 0.0, 1.0) * u_depthSize);
   p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
   vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
-  float bestD = texelFetch(u_depth, p, 0).r;
-  float bestDist = 1e9;
+  float dmin = 1e9, dmax = -1e9, cmin = 1e9, cmax = 1e9;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
+      if (dx == 0 && dy == 0) continue;
       ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
       vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
       float dist = dot(c0 - c, c0 - c);
       float d = texelFetch(u_depth, q, 0).r;
-      if (dist < bestDist - 1e-7 || (abs(dist - bestDist) <= 1e-7 && d > bestD)) {
-        bestDist = dist;
-        bestD = d;
-      }
+      if (d < dmin) { dmin = d; cmin = dist; }
+      if (d > dmax) { dmax = d; cmax = dist; }
     }
   }
-  return bestD;
+  float center = texelFetch(u_depth, p, 0).r;
+  float range = dmax - dmin;
+  // Only snap when the centre sits inside the mixed band. A solid near/far
+  // pixel is already at one extreme; leaving it alone avoids flattening slopes.
+  if (range > 0.01 && center > dmin + 0.15 * range && center < dmax - 0.15 * range) {
+    if (cmin < cmax) return dmin;
+    if (cmax < cmin) return dmax;
+    return dmax;                       // exact tie: lean foreground
+  }
+  return center;
 }
 
 void main() {
@@ -329,20 +379,88 @@ void main() {
   float band = max(dFocus * 0.02, 1e-4);
   float nearPart = smoothstep(dFocus - band, dFocus + band, d);
   float belongs = u_layer == 0 ? nearPart : 1.0 - nearPart;
-  float radius = 0.5 * min(cocDiameter(d), u_maxRadius);
+  float radius = min(0.5 * cocDiameter(d), u_maxRadius);
 
   if (u_info == 1) {
     outColor = vec4(radius * belongs / u_infoScale, 0.0, 0.0, 1.0);
     return;
   }
 
+  // The radiance texture expands clipped highlights at mip 0, before any
+  // prefiltering, so its mip pyramid carries the real energy. Mixing it in
+  // here by the pixel's own blur radius keeps the sharp base unexpanded and
+  // makes preview and export agree at every scale.
   vec3 c = textureLod(u_photo, puv, baseLod()).rgb;
-  float clipped = textureLod(u_photo, puv, baseLod()).a;
-  float localClip = textureLod(u_photo, puv, 5.0 + baseLod()).a;
+  vec3 rad = textureLod(u_radiance, puv, baseLod()).rgb;
   float spread = smoothstep(0.5, 4.0, radius);
-  float iso = 1.0 - smoothstep(0.15, 0.6, localClip);
-  c *= exp2(u_hlStops * clipped * iso * spread);
+  c = mix(c, rad, spread);
   outColor = vec4(c * belongs, belongs);
+}`;
+
+  // Tile-max of the near layer's CoC. One texel covers a 32x32 block of the
+  // near layer; the value is radius*coverage/coverage, written in the same
+  // infoScale units as the layer info so it also works on R8 targets.
+  const TILE_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_layerTex;
+uniform sampler2D u_infoTex;
+uniform vec2 u_res;
+uniform vec2 u_tileCount;
+uniform float u_tile;
+uniform float u_infoScale;
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  ivec2 t = ivec2(uv * u_tileCount);
+  t = clamp(t, ivec2(0), ivec2(u_tileCount) - 1);
+  vec2 origin = vec2(t) * u_tile;
+  float maxR = 0.0;
+  for (int y = 0; y < 32; y++) {
+    for (int x = 0; x < 32; x++) {
+      vec2 p = (origin + vec2(float(x), float(y)) + 0.5) / u_res;
+      vec4 s = textureLod(u_layerTex, p, 0.0);
+      if (s.a > 0.02) {
+        float r = textureLod(u_infoTex, p, 0.0).r * u_infoScale / max(s.a, 1e-4);
+        maxR = max(maxR, r);
+      }
+    }
+  }
+  outColor = vec4(maxR / u_infoScale, 0.0, 0.0, 1.0);
+}`;
+
+  // Dilate the tile max by a whole-tile neighbourhood. A foreground source can
+  // reach any destination within its own CoC, so the destination's gather
+  // radius must see every tile whose centre is within that reach.
+  const NEIGH_FRAG = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform sampler2D u_tileTex;
+uniform vec2 u_tileCount;
+uniform int u_ntiles;
+
+void main() {
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  ivec2 t = ivec2(uv * u_tileCount);
+  t = clamp(t, ivec2(0), ivec2(u_tileCount) - 1);
+  float m = 0.0;
+  for (int dy = -32; dy <= 32; dy++) {
+    if (abs(dy) > u_ntiles) continue;
+    for (int dx = -32; dx <= 32; dx++) {
+      if (abs(dx) > u_ntiles) continue;
+      ivec2 q = clamp(t + ivec2(dx, dy), ivec2(0), ivec2(u_tileCount) - 1);
+      m = max(m, textureLod(u_tileTex, (vec2(q) + 0.5) / u_tileCount, 0.0).r);
+    }
+  }
+  outColor = vec4(m, 0.0, 0.0, 1.0);
 }`;
 
   // Blur one layer using its own CoC field. The mip probe pulls a filled
@@ -364,6 +482,7 @@ uniform sampler2D u_layerTex;
 uniform sampler2D u_infoTex;
 uniform sampler2D u_photo;
 uniform sampler2D u_depth;
+uniform sampler2D u_cocTex;
 uniform vec2 u_depthSize;
 uniform vec2 u_res;
 uniform float u_fpxNative;
@@ -407,21 +526,28 @@ float depthAt(vec2 puv) {
   ivec2 p = ivec2(clamp(puv, 0.0, 1.0) * u_depthSize);
   p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
   vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
-  float bestD = texelFetch(u_depth, p, 0).r;
-  float bestDist = 1e9;
+  float dmin = 1e9, dmax = -1e9, cmin = 1e9, cmax = 1e9;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
+      if (dx == 0 && dy == 0) continue;
       ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
       vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
       float dist = dot(c0 - c, c0 - c);
       float d = texelFetch(u_depth, q, 0).r;
-      if (dist < bestDist - 1e-7 || (abs(dist - bestDist) <= 1e-7 && d > bestD)) {
-        bestDist = dist;
-        bestD = d;
-      }
+      if (d < dmin) { dmin = d; cmin = dist; }
+      if (d > dmax) { dmax = d; cmax = dist; }
     }
   }
-  return bestD;
+  float center = texelFetch(u_depth, p, 0).r;
+  float range = dmax - dmin;
+  // Only snap when the centre sits inside the mixed band. A solid near/far
+  // pixel is already at one extreme; leaving it alone avoids flattening slopes.
+  if (range > 0.01 && center > dmin + 0.15 * range && center < dmax - 0.15 * range) {
+    if (cmin < cmax) return dmin;
+    if (cmax < cmin) return dmax;
+    return dmax;                       // exact tie: lean foreground
+  }
+  return center;
 }
 
 float ign(vec2 p) {
@@ -445,20 +571,43 @@ float apertureShape(vec2 q, float srad, vec2 field, float fstop, float nearSign)
   float limit = apertureLimit(atan(q.y, q.x), roundness);
   float shape = smoothstep(1.0, 0.965, r / max(limit, 1e-3));
 
-  // Mechanical cat's eye: the pupil is clipped by an offset circle of a
-  // slightly smaller radius. The two radii differ, unlike the old dead code
-  // where the sign flip did nothing.
+  // Mechanical cat's eye: the pupil is clipped by an equal-radius circle
+  // offset toward the frame edge. Equal radii give the almond shape (the old
+  // 0.78 radius gave a shrunken round disc), and the 0.60 offset matches the
+  // field-angle clipping of a fast lens without tearing near/far apart.
   float fieldR = length(field);
   float cat = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, fstop));
   vec2 dir = field / max(fieldR, 1e-4);
-  float r2 = 1.0 - 0.22 * cat;
-  float clip2 = smoothstep(r2, r2 - 0.05, length(q - dir * (0.30 * cat)));
+  float clip2 = smoothstep(1.0, 0.95, length(q - dir * (0.60 * cat)));
   shape *= mix(1.0, clip2, cat);
 
   // Mild spherical-aberration rim: bright rim on one side of focus, soft centre
-  // on the other. The coverage normalisation below makes it energy-neutral.
-  float rim = 1.0 + 0.10 * nearSign * (2.0 * pow(min(r, 1.0), 2.0) - 0.55);
+  // on the other. 2r^2 - 1 has a disc mean of zero, so the profile is genuinely
+  // energy-neutral; the old -0.55 biased the near alpha +4.5%.
+  float rim = 1.0 + 0.10 * nearSign * (2.0 * pow(min(r, 1.0), 2.0) - 1.0);
   return max(shape * rim, 0.0);
+}
+
+// Fill colour for the background hidden behind a near object. The far layer's
+// first covered mips only give a small blur; a 16-tap gather at the local
+// background CoC keeps the fill smooth instead of switching from sharp photo
+// to a mip blob at the silhouette. Depth is intentionally ignored here: the
+// point of the fill is the plane that the depth test correctly rejects.
+vec3 fillColour(vec2 uv, float frad) {
+  float flod = clamp(log2(max(1.0, frad * sqrt(PI / 16.0))) - 0.5, 0.0, u_maxLod);
+  float fa = ign(gl_FragCoord.xy + 11.0) * TAU;
+  vec3 fc = vec3(0.0);
+  float fw = 0.0;
+  for (int i = 0; i < 16; i++) {
+    float fi = float(i) + 0.5;
+    float rr = sqrt(fi / 16.0) * frad;
+    float aa = fi * GOLDEN + fa;
+    vec2 suv = clamp(uv + vec2(cos(aa), sin(aa)) * rr / u_res, vec2(0.0), vec2(1.0));
+    vec4 s = textureLod(u_layerTex, suv, flod);
+    if (s.a > 0.02) { fc += s.rgb; fw += s.a; }
+  }
+  if (fw > 1e-4) return fc / fw;
+  return textureLod(u_photo, uv, baseLod()).rgb;
 }
 
 void main() {
@@ -469,37 +618,38 @@ void main() {
   float band = max(dFocus * 0.02, 1e-4);
   float nearPart = smoothstep(dFocus - band, dFocus + band, d);
   float belongs = u_layer == 0 ? nearPart : 1.0 - nearPart;
-  float own = belongs > 0.01 ? 0.5 * min(cocDiameter(d), u_maxRadius) : 0.0;
+  float own = belongs > 0.01 ? min(0.5 * cocDiameter(d), u_maxRadius) : 0.0;
 
-  // Mip fill. The near layer takes the max radius across covered levels so a
-  // defocused foreground spreads outward. The far layer takes the first covered
-  // level: that is the background colour hidden behind the subject.
-  float fill = own;
-  vec4 fillCol = vec4(0.0);
-  for (int probe = 0; probe < 12; probe++) {
-    float lod = min(float(probe), u_maxLod);
-    vec4 probeCol = textureLod(u_layerTex, uv, lod);
-    float cov = probeCol.a;
-    if (cov > 0.02) {
-      float pr = textureLod(u_infoTex, uv, lod).r * u_infoScale / max(cov, 1e-4);
-      fill = max(fill, pr);
-      if (probeCol.a > fillCol.a) {
-        fillCol = probeCol;
+  // A true max of the near CoC over the reach of a visible foreground. The
+  // old colour-mip probe used a coverage-weighted mean and took the max over
+  // all levels: it overestimated far from any foreground and truncated small
+  // very defocused objects. The tile-max + neighbour-max field does neither.
+  float nearMax = texture(u_cocTex, uv).r * u_infoScale;
+
+  // The far layer probes its own mips for the hidden background's local CoC.
+  // The 16-tap fill gather below uses it; the gather radius uses it too so the
+  // fill is covered by the same aperture.
+  float fill = 0.0;
+  if (u_layer == 1) {
+    for (int probe = 0; probe < 12; probe++) {
+      float lod = min(float(probe), u_maxLod);
+      vec4 probeCol = textureLod(u_layerTex, uv, lod);
+      if (probeCol.a > 0.02) {
+        fill = textureLod(u_infoTex, uv, lod).r * u_infoScale / max(probeCol.a, 1e-4);
+        break;
       }
-      if (u_layer == 1) break;
+      if (lod >= u_maxLod) break;
     }
-    if (lod >= u_maxLod) break;
   }
-  float radius = min(fill, u_maxRadius);
+  // 1.05 covers the 9-gon circumradius (1.042); without it the circular source
+  // test clips the polygon vertices and the aperture is never visible.
+  float radius = min(max(max(own, nearMax), fill) * 1.05, u_maxRadius);
 
   if (radius < 0.55) {
     if (u_layer == 1) {
-      // The background is a full plane. If this pixel is covered by a near
-      // object, the probe found the surrounding background; use it so the
-      // composite never shows black behind a near edge.
-      float cov = smoothstep(0.0, 0.08, fillCol.a);
-      vec3 col = fillCol.rgb / max(fillCol.a, 1e-4);
-      outColor = vec4(col * cov, cov);
+      vec4 direct = textureLod(u_layerTex, uv, 0.0);
+      if (direct.a > 0.02) outColor = vec4(direct.rgb / direct.a, 1.0);
+      else outColor = vec4(fillColour(uv, max(fill, 1.0)), 1.0);
     } else {
       outColor = textureLod(u_layerTex, uv, 0.0);
     }
@@ -510,10 +660,10 @@ void main() {
   field.x *= u_res.x / max(u_res.y, 1.0);
   float fieldR = length(field);
   float catDest = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, u_fstop));
-  // Full cat's-eye clipping (two unit circles offset by 0.30, r2 = 0.78) leaves
-  // 0.585 of the aperture. Divide the coverage alpha by the shape area so a
-  // vignetted pupil does not make an opaque foreground transparent at the edge.
-  float shapeArea = 1.0 - 0.415 * catDest;
+  // Equal unit circles offset by 0.60 leave 0.624 of the aperture. Divide the
+  // coverage alpha by that area so a vignetted pupil does not make an opaque
+  // foreground transparent at the edge.
+  float shapeArea = 1.0 - 0.376 * catDest;
   float spin = ign(gl_FragCoord.xy + vec2(float(u_layer) * 19.0, 0.0)) * TAU;
   float lod = clamp(log2(max(1.0, radius * sqrt(PI / float(u_taps)))) - 0.5, 0.0, u_maxLod);
   float A = PI * radius * radius / float(u_taps);
@@ -533,7 +683,7 @@ void main() {
     vec4 s0 = textureLod(u_layerTex, sUV, 0.0);
     float cov = max(s0.a, 1e-4);
     float srad = textureLod(u_infoTex, sUV, 0.0).r * u_infoScale / cov;
-    float inside = smoothstep(r - 1.0, r + 1.0, srad);
+    float reach = 1.0;
 
     // A source beyond the destination's own blur radius is only allowed to
     // contribute if it is NEARER than the destination; otherwise a blurrier
@@ -543,7 +693,7 @@ void main() {
       ivec2 sp = ivec2(clamp(puvS, 0.0, 1.0) * u_depthSize);
       sp = clamp(sp, ivec2(0), ivec2(u_depthSize) - 1);
       float sd = texelFetch(u_depth, sp, 0).r;
-      if (sd < d) inside = 0.0;
+      if (sd < d) reach = 0.0;
     }
 
     vec2 q = (uv - sUV) * u_res;
@@ -554,30 +704,27 @@ void main() {
     float shape = apertureShape(q / max(srad, 1e-3), srad, fieldS,
                                 u_fstop, u_layer == 0 ? 1.0 : -1.0);
     // The weight of a fully covered source must integrate to 1. wFull is the
-    // aperture-area share of this tap; inside is the fraction of the source's
-    // disc that reaches the destination. The near-field alpha is the covered
-    // share divided by the full aperture share, i.e. real coverage.
+    // aperture-area share of this tap; reach is the source's own disc test.
+    // The near-field alpha is the covered share divided by the full aperture
+    // share, i.e. real coverage, not an opaque average.
     float wFull = shape * A / (PI * max(srad * srad, 0.25));
-    float w = inside * wFull;
+    float w = reach * wFull;
 
     acc += vec4(sc * cov * w, cov * w);
   }
 
-  // A/(PI*srad^2) makes a fully covered source integrate to 1, so acc.a is
-  // the covered fraction of the aperture. The cat's-eye mask reduces the
-  // aperture area at the frame edge; divide by that area so an opaque subject
-  // stays opaque while the blur still carries the vignetting shape.
   float alpha = clamp(acc.a / max(shapeArea, 0.20), 0.0, 1.0);
   vec3 col = acc.rgb / max(acc.a, 1e-4);
   if (u_layer == 1) {
-    // Far field: a full background plane, filled from the probe where needed.
-    if (acc.a < 1e-4) {
-      col = fillCol.rgb / max(fillCol.a, 1e-4);
-      alpha = 1.0;
-    }
-    outColor = vec4(col, clamp(alpha, 0.0, 1.0));
+    // The far plane is opaque. Where the depth test rejected every far source
+    // (the background hidden behind a near silhouette), fill from the local
+    // background instead of leaving black.
+    if (acc.a < 1e-4) col = fillColour(uv, max(fill, 1.0));
+    outColor = vec4(col, 1.0);
   } else {
-    outColor = vec4(col, clamp(alpha, 0.0, 1.0));
+    // Premultiplied near colour: the final pass composites with
+    // n.rgb + f.rgb * (1 - n.a), Porter-Duff "over".
+    outColor = vec4(col * alpha, alpha);
   }
 }`;
 
@@ -631,10 +778,21 @@ void main() {
     if (!gl) throw new Error("WebGL2 is not available in this browser.");
     S.gl = gl;
 
+    canvas.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      S.busy = false;
+      overlay(true, "GPU context lost",
+        "The browser reset the GPU while rendering. Reload the page to rebuild the textures.", 100);
+    });
+    canvas.addEventListener("webglcontextrestored", () => location.reload());
+
     S.progFinal = makeProgram(gl, FINAL_FRAG, `final`);
     S.progLayer = makeProgram(gl, LAYER_FRAG, `layer`);
     S.progBlur = makeProgram(gl, LAYER_BLUR_FRAG, `layer blur`);
     S.progPre = makeProgram(gl, PRE_FRAG, `pre-pass`);
+    S.progRad = makeProgram(gl, RADIANCE_FRAG, `radiance`);
+    S.progTile = makeProgram(gl, TILE_FRAG, `coc tile max`);
+    S.progNeigh = makeProgram(gl, NEIGH_FRAG, `coc neighbour max`);
     S.locFinal = uniformLocations(gl, S.progFinal, [
       `u_photo`, `u_depth`, `u_near`, `u_far`, `u_depthSize`,
       `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`, `u_scale`, `u_blur`,
@@ -642,15 +800,22 @@ void main() {
       `u_res`, `u_zoom`, `u_center`,
     ]);
     S.locLayer = uniformLocations(gl, S.progLayer, [
-      `u_photo`, `u_depth`, `u_depthSize`, `u_fpxNative`, `u_fmm`,
-      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxRadius`, `u_hlStops`,
+      `u_photo`, `u_radiance`, `u_depth`, `u_depthSize`, `u_fpxNative`, `u_fmm`,
+      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxRadius`,
       `u_infoScale`, `u_layer`, `u_info`, `u_linear`, `u_zoom`, `u_center`,
     ]);
     S.locBlur = uniformLocations(gl, S.progBlur, [
-      `u_layerTex`, `u_infoTex`, `u_photo`, `u_depth`, `u_depthSize`,
+      `u_layerTex`, `u_infoTex`, `u_photo`, `u_depth`, `u_cocTex`, `u_depthSize`,
       `u_res`, `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`, `u_scale`,
       `u_blur`, `u_maxRadius`, `u_maxLod`, `u_infoScale`, `u_layer`,
       `u_taps`, `u_zoom`, `u_center`,
+    ]);
+    S.locRad = uniformLocations(gl, S.progRad, [`u_lin`, `u_hlStops`]);
+    S.locTile = uniformLocations(gl, S.progTile, [
+      `u_layerTex`, `u_infoTex`, `u_res`, `u_tileCount`, `u_tile`, `u_infoScale`,
+    ]);
+    S.locNeigh = uniformLocations(gl, S.progNeigh, [
+      `u_tileTex`, `u_tileCount`, `u_ntiles`,
     ]);
     S.locPre.u_src = gl.getUniformLocation(S.progPre, "u_src");
     S.fbo = gl.createFramebuffer();
@@ -658,7 +823,7 @@ void main() {
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-    for (const key of ["photo", "depth", "linear"]) {
+    for (const key of ["photo", "depth", "linear", "radiance"]) {
       const t = gl.createTexture();
       gl.bindTexture(gl.TEXTURE_2D, t);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -730,6 +895,53 @@ void main() {
     }
     S.linearOK = ok;
     return ok;
+  }
+
+  // Expand clipped highlights at full photo resolution, before the layer mips
+  // prefilter the colour. u_hlStops is the only thing that changes when the
+  // highlight slider moves, so a re-render reuses the same allocation.
+  function buildRadianceTexture(w, h, allocate = true) {
+    const gl = S.gl;
+    S.radianceOK = false;
+    if (!S.linearOK || !S.colorFloat) return false;
+
+    gl.bindTexture(gl.TEXTURE_2D, S.tex.radiance);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (allocate || S.radianceW !== w || S.radianceH !== h) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      S.radianceW = w;
+      S.radianceH = h;
+    }
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, S.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, S.tex.radiance, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    if (ok) {
+      gl.viewport(0, 0, w, h);
+      gl.useProgram(S.progRad);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, S.tex.linear);
+      gl.uniform1i(S.locRad.u_lin, 0);
+      gl.uniform1f(S.locRad.u_hlStops, S.highlight * 5.0);
+      useQuad(S.progRad);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (ok) {
+      gl.bindTexture(gl.TEXTURE_2D, S.tex.radiance);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      glError(gl, "radiance mip pyramid");
+    }
+    S.radianceOK = ok;
+    return ok;
+  }
+
+  function renderRadiance() {
+    if (!S.radianceOK || !S.radianceW || !S.radianceH) return;
+    buildRadianceTexture(S.radianceW, S.radianceH, false);
   }
 
   const halfFloatScratch = new Float32Array(1);
@@ -829,6 +1041,7 @@ void main() {
     glError(gl, "depth upload");
 
     buildLinearTexture(targetW, targetH);
+    buildRadianceTexture(targetW, targetH, true);
   }
 
   /* --------------------------------------------------------------- rendering */
@@ -836,7 +1049,8 @@ void main() {
   function releaseTargets() {
     if (!S.targets) return;
     const gl = S.gl;
-    for (const key of ["nearColour", "farColour", "nearInfo", "farInfo", "nearBlur", "farBlur"]) {
+    for (const key of ["nearColour", "farColour", "nearInfo", "farInfo", "nearBlur", "farBlur",
+                       "cocTile", "cocNeighbour"]) {
       if (S.targets[key]) gl.deleteTexture(S.targets[key]);
     }
     S.targets = null;
@@ -876,21 +1090,28 @@ void main() {
     releaseTargets();
     const gl = S.gl;
     const levels = 1 + Math.floor(Math.log2(Math.max(w, h)));
+    const tile = 32;
+    const tileW = Math.max(1, Math.ceil(w / tile));
+    const tileH = Math.max(1, Math.ceil(h / tile));
     const colourFormat = S.colorFloat ? gl.RGBA16F : gl.RGBA8;
     const infoFormat = S.colorFloat ? gl.R16F : gl.R8;
     const targets = {
       w, h, levels,
       maxLod: levels - 1,
       infoScale: S.colorFloat ? 1 : Math.max(1, Math.min(w, h) * 0.20),
+      tile, tileW, tileH,
       nearColour: makeTargetTexture(colourFormat, w, h, levels, true),
       farColour: makeTargetTexture(colourFormat, w, h, levels, true),
       nearInfo: makeTargetTexture(infoFormat, w, h, levels, true),
       farInfo: makeTargetTexture(infoFormat, w, h, levels, true),
       nearBlur: makeTargetTexture(colourFormat, w, h, 1, false),
       farBlur: makeTargetTexture(colourFormat, w, h, 1, false),
+      cocTile: makeTargetTexture(infoFormat, tileW, tileH, 1, false),
+      cocNeighbour: makeTargetTexture(infoFormat, tileW, tileH, 1, false),
     };
     S.targets = targets;
-    for (const key of ["nearColour", "farColour", "nearInfo", "farInfo", "nearBlur", "farBlur"]) {
+    for (const key of ["nearColour", "farColour", "nearInfo", "farInfo", "nearBlur", "farBlur",
+                       "cocTile", "cocNeighbour"]) {
       attachTarget(targets[key]);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -914,7 +1135,64 @@ void main() {
     gl.uniform2f(loc.u_center, S.cx, S.cy);
   }
 
-  function prepareLayers(linear) {
+  function buildCocMax(t) {
+    const gl = S.gl;
+    gl.useProgram(S.progTile);
+    useQuad(S.progTile);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, t.nearColour);
+    gl.uniform1i(S.locTile.u_layerTex, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, t.nearInfo);
+    gl.uniform1i(S.locTile.u_infoTex, 1);
+    gl.uniform2f(S.locTile.u_res, t.w, t.h);
+    gl.uniform2f(S.locTile.u_tileCount, t.tileW, t.tileH);
+    gl.uniform1f(S.locTile.u_tile, t.tile);
+    gl.uniform1f(S.locTile.u_infoScale, t.infoScale);
+    gl.viewport(0, 0, t.tileW, t.tileH);
+    attachTarget(t.cocTile);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    const maxR = Math.min(t.w, t.h) * 0.10 * S.zoom;
+    const ntiles = Math.max(1, Math.min(32, Math.ceil(maxR / t.tile) + 1));
+    gl.useProgram(S.progNeigh);
+    useQuad(S.progNeigh);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, t.cocTile);
+    gl.uniform1i(S.locNeigh.u_tileTex, 0);
+    gl.uniform2f(S.locNeigh.u_tileCount, t.tileW, t.tileH);
+    gl.uniform1i(S.locNeigh.u_ntiles, ntiles);
+    gl.viewport(0, 0, t.tileW, t.tileH);
+    attachTarget(t.cocNeighbour);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // The export runs on a 24 MP target; a single 192-tap draw can approach the
+  // Windows TDR limit. Split full-screen draws into horizontal bands and flush
+  // between them. Preview frames stay single-draw.
+  function drawFullscreen(tiled, w, h, band = 512) {
+    const gl = S.gl;
+    if (!tiled) {
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      return;
+    }
+    // Keep the full-screen viewport: changing it would rescale v_uv and each
+    // band would show the whole image. The scissor restricts the raster to the
+    // band while the shader still sees the correct full-frame coordinates.
+    gl.viewport(0, 0, w, h);
+    gl.enable(gl.SCISSOR_TEST);
+    for (let y = 0; y < h; y += band) {
+      const hh = Math.min(band, h - y);
+      gl.scissor(0, y, w, hh);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.flush();
+    }
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, w, h);
+  }
+
+  function prepareLayers(linear, tiled) {
     const gl = S.gl, t = S.targets;
     const source = linear ? S.tex.linear : S.tex.photo;
     gl.useProgram(S.progLayer);
@@ -925,25 +1203,26 @@ void main() {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
     gl.uniform1i(S.locLayer.u_depth, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, S.radianceOK ? S.tex.radiance : source);
+    gl.uniform1i(S.locLayer.u_radiance, 2);
     setLayerUniforms(S.locLayer, t.w, t.h, linear);
-    // The clip mask only exists on the linear texture; the raw fallback has no
-    // highlight headroom to recover.
-    gl.uniform1f(S.locLayer.u_hlStops, linear ? S.highlight * 5.0 : 0.0);
     gl.uniform1f(S.locLayer.u_infoScale, t.infoScale);
 
     for (let layer = 0; layer < 2; layer++) {
       const colour = layer === 0 ? t.nearColour : t.farColour;
       const info = layer === 0 ? t.nearInfo : t.farInfo;
       gl.uniform1i(S.locLayer.u_layer, layer);
-      gl.viewport(0, 0, t.w, t.h);
 
       attachTarget(colour);
+      gl.viewport(0, 0, t.w, t.h);
       gl.uniform1i(S.locLayer.u_info, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      drawFullscreen(tiled, t.w, t.h);
 
       attachTarget(info);
+      gl.viewport(0, 0, t.w, t.h);
       gl.uniform1i(S.locLayer.u_info, 1);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      drawFullscreen(tiled, t.w, t.h);
     }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -951,10 +1230,11 @@ void main() {
       gl.bindTexture(gl.TEXTURE_2D, texture);
       gl.generateMipmap(gl.TEXTURE_2D);
     }
+    buildCocMax(t);
     glError(gl, "layer pyramid");
   }
 
-  function blurLayers(taps, linear) {
+  function blurLayers(taps, linear, tiled) {
     const gl = S.gl, t = S.targets;
     gl.useProgram(S.progBlur);
     useQuad(S.progBlur);
@@ -970,6 +1250,9 @@ void main() {
     gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
     gl.uniform1i(S.locBlur.u_depth, 3);
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, t.cocNeighbour);
+    gl.uniform1i(S.locBlur.u_cocTex, 4);
     gl.viewport(0, 0, t.w, t.h);
 
     for (let layer = 0; layer < 2; layer++) {
@@ -981,13 +1264,14 @@ void main() {
       gl.uniform1i(S.locBlur.u_infoTex, 1);
       gl.uniform1i(S.locBlur.u_layer, layer);
       attachTarget(layer === 0 ? t.nearBlur : t.farBlur);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.viewport(0, 0, t.w, t.h);
+      drawFullscreen(tiled, t.w, t.h);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     if (S.busy) glError(gl, "layered bokeh", false);
   }
 
-  function renderFinal(mode, useLinear, taps) {
+  function renderFinal(mode, useLinear, taps, tiled) {
     const gl = S.gl, canvas = $("view"), m = S.meta;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, canvas.width, canvas.height);
@@ -1024,7 +1308,7 @@ void main() {
     gl.uniform2f(S.locFinal.u_depthSize, S.depthW || m.width, S.depthH || m.height);
     gl.uniform1f(S.locFinal.u_zoom, S.zoom);
     gl.uniform2f(S.locFinal.u_center, S.cx, S.cy);
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    drawFullscreen(tiled, canvas.width, canvas.height);
     if (S.busy) glError(gl, "final render", false);
   }
 
@@ -1033,14 +1317,15 @@ void main() {
     if (!S.meta || !S.progFinal) return;
     if (!canvas.width || !canvas.height || gl.isContextLost()) return;
 
-    const effMode = S.holdOriginal ? 2 : S.mode;
+    const effMode = (S.holdOriginal && !forExport) ? 2 : S.mode;
     const useLinear = S.linearOK && effMode !== 2;
+    const tiled = forExport;
     if (effMode === 0) {
       ensureTargets(canvas.width, canvas.height);
-      prepareLayers(useLinear);
-      blurLayers(taps, useLinear);
+      prepareLayers(useLinear, tiled);
+      blurLayers(taps, useLinear, tiled);
     }
-    renderFinal(effMode, useLinear, taps);
+    renderFinal(effMode, useLinear, taps, tiled);
   }
 
   function requestRender() {
@@ -1342,22 +1627,29 @@ void main() {
     const prevW = canvas.width, prevH = canvas.height;
     const prevMode = S.mode;
     const prevZoom = S.zoom, prevCx = S.cx, prevCy = S.cy;
-    canvas.width = w;
-    canvas.height = h;
-    S.mode = mode;
-    S.zoom = 1; S.cx = 0.5; S.cy = 0.5;   // export is always the whole frame
-    render(taps, true);
-
-    const blob = await new Promise((res) => canvas.toBlob(res, mime, S.quality / 100));
-
-    S.mode = prevMode;
-    S.zoom = prevZoom;
-    S.cx = prevCx;
-    S.cy = prevCy;
-    canvas.width = prevW;
-    canvas.height = prevH;
-    layout();
-    updateZoomUI();
+    let blob = null;
+    try {
+      canvas.width = w;
+      canvas.height = h;
+      const gl = S.gl;
+      if (gl.drawingBufferWidth < w || gl.drawingBufferHeight < h) {
+        throw new Error(`The GPU drawing buffer is only ${gl.drawingBufferWidth} × ${gl.drawingBufferHeight}; ` +
+                        `the requested ${w} × ${h} export is too large for this browser.`);
+      }
+      S.mode = mode;
+      S.zoom = 1; S.cx = 0.5; S.cy = 0.5;   // export is always the whole frame
+      render(taps, true);
+      blob = await new Promise((res) => canvas.toBlob(res, mime, S.quality / 100));
+    } finally {
+      S.mode = prevMode;
+      S.zoom = prevZoom;
+      S.cx = prevCx;
+      S.cy = prevCy;
+      canvas.width = prevW;
+      canvas.height = prevH;
+      layout();
+      updateZoomUI();
+    }
     overlay(false);
 
     if (!blob) throw new Error("The browser could not encode the image.");
@@ -1472,6 +1764,7 @@ void main() {
 
     $("highlight").addEventListener("input", (e) => {
       S.highlight = +e.target.value / 100;
+      renderRadiance();
       updateLensUI();
       requestRender();
     });
@@ -1701,6 +1994,6 @@ void main() {
   // Headless-renderer test hook. Only with ?debug: a probe can set the state
   // and paint a frame without going through the sliders.
   if (new URLSearchParams(location.search).has("debug")) {
-    window.__dof = { S, render, requestRender, layout, updateFocusUI, updateLensUI };
+    window.__dof = { S, render, requestRender, layout, updateFocusUI, updateLensUI, exportRender };
   }
 })();

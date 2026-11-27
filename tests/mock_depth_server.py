@@ -8,6 +8,7 @@ The scene is intentionally simple and known:
   - background plane: textured, depth 6 m at the top to 12 m at the bottom
   - midground rectangle: flat 4 m
   - near disc: flat 1.5 m, with a fine pattern and one clipped specular dot
+  - near coin: flat 1.5 m, 8 px radius, to exercise a small very defocused object
 
 Launch:  python3 tests/mock_depth_server.py --port 7860
 """
@@ -34,6 +35,7 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     z_bg = 6.0 + 6.0 * (yy / (H - 1))
 
     near = (xx - 330) ** 2 + (yy - 360) ** 2 < 130 ** 2
+    small = (xx - 640) ** 2 + (yy - 500) ** 2 < 8 ** 2
     mid = (xx > 600) & (xx < 860) & (yy > 180) & (yy < 460)
 
     base = 0.32 + 0.10 * np.sin(xx / 23.0) + 0.07 * np.cos(yy / 31.0)
@@ -43,6 +45,7 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     # Keep the near red below the clipping threshold; only the specular dot
     # should be clipped, so the highlight-expansion test measures the dot.
     img[near] = np.stack([0.68 + 0.12 * tex, 0.22 + 0.40 * tex, 0.15 + 0.20 * tex], axis=-1)[near]
+    img[small] = np.array([0.86, 0.58, 0.20])
     spec = (xx - 300) ** 2 + (yy - 320) ** 2 < 5 ** 2
     img[spec] = [1.0, 1.0, 1.0]
     img += rng.normal(0.0, 0.018, img.shape)
@@ -51,6 +54,7 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     z = z_bg.copy()
     z[mid] = 4.0
     z[near] = 1.5
+    z[small] = 1.5
     inv = (1.0 / z).astype(np.float32)
     return (img * 255.0 + 0.5).astype(np.uint8), inv
 

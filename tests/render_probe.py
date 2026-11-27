@@ -103,6 +103,13 @@ def main() -> None:
     ap.add_argument("--cx", type=float, default=0.5)
     ap.add_argument("--cy", type=float, default=0.5)
     ap.add_argument("--export", action="store_true")
+    ap.add_argument("--export-ui", action="store_true",
+                    help="drive the real exportRender path and capture the download")
+    ap.add_argument("--download-dir", default="/tmp/dof-probe-downloads")
+    ap.add_argument("--no-tile", action="store_true",
+                    help="render an export-sized frame without the 512-row tiling")
+    ap.add_argument("--preview-scale", type=float, default=1.0,
+                    help="render the non-export frame at this fraction of the photo size")
     ap.add_argument("--mode", type=int, default=0)
     args = ap.parse_args()
 
@@ -134,6 +141,43 @@ def main() -> None:
             raise RuntimeError("sample never rendered; events: " + json.dumps(errs)[:4000])
         cdp.eval("document.getElementById('sampleBtn').blur()")
 
+        if args.export_ui:
+            dl = Path(args.download_dir)
+            dl.mkdir(parents=True, exist_ok=True)
+            for stale in dl.glob("*_probe.png"):
+                stale.unlink()
+            cdp.send("Page.setDownloadBehavior", behavior="allow", downloadPath=str(dl))
+            cdp.eval(f"""(() => {{
+              const d = window.__dof;
+              d.S.focus = {args.focus}; d.S.fstopIdx = {args.fstop};
+              d.S.lensMM = {args.lens}; d.S.blur = {args.blur};
+              d.S.highlight = {args.highlight}; d.S.grain = {args.grain};
+              d.S.mode = 0; d.S.holdOriginal = false; d.S.zoom = 1;
+              d.S.cx = 0.5; d.S.cy = 0.5;
+              d.updateFocusUI(); d.updateLensUI();
+              return true;
+            }})()""")
+            exported = cdp.eval(
+                "window.__dof.exportRender({mode:0,mime:'image/png',ext:'png',taps:192,tag:'probe'})"
+                ".then(() => ({mode: window.__dof.S.mode, w: document.getElementById('view').width,"
+                " h: document.getElementById('view').height, glErr: window.__dof.S.gl.getError()}))",
+                await_promise=True, timeout_s=420)
+            deadline = time.time() + 60
+            out_file = None
+            while time.time() < deadline:
+                files = sorted(dl.glob("*_probe.png"), key=lambda p: p.stat().st_mtime)
+                if files and files[-1].stat().st_size > 0:
+                    out_file = files[-1]
+                    break
+                time.sleep(0.25)
+            if out_file is None:
+                raise RuntimeError("exportRender produced no download in " + str(dl))
+            print(json.dumps({"out": str(out_file), "bytes": out_file.stat().st_size,
+                              "result": exported,
+                              "errors": [e for e in cdp.events if e.get("method") in
+                                         ("Runtime.exceptionThrown", "Log.entryAdded")][:5]}, indent=2))
+            return
+
         js = f"""(() => {{
           const d = window.__dof;
           const c = document.getElementById('view');
@@ -154,8 +198,12 @@ def main() -> None:
           if ({str(args.export).lower()}) {{
             c.width = d.S.meta.width;
             c.height = d.S.meta.height;
+          }} else if ({args.preview_scale} !== 1.0) {{
+            c.width = Math.max(1, Math.round(d.S.meta.width * {args.preview_scale}));
+            c.height = Math.max(1, Math.round(d.S.meta.height * {args.preview_scale}));
           }}
-          d.render({args.taps}, {str(args.export).lower()});
+          d.render({args.taps}, {str(args.export).lower()} && !{str(args.no_tile).lower()});
+          const glErr = d.S.gl.getError();
           const data = c.toDataURL('image/png');
           if ({str(args.export).lower()}) {{
             c.width = prevW;
@@ -166,6 +214,7 @@ def main() -> None:
             data,
             w: c.width, h: c.height,
             focus: d.S.focus, fstop: d.S.fstopIdx, lens: d.S.lensMM,
+            glErr,
             meta: {{width: d.S.meta.width, height: d.S.meta.height, f_px: d.S.meta.f_px}},
           }};
         }})()"""
