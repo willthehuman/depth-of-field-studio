@@ -73,7 +73,7 @@
     </div>
 
     <div class="hud hud-bl" id="hudStats"></div>
-    <div class="hud hud-br" id="hudHint">Click photo to focus · <kbd>Space</kbd> original</div>
+    <div class="hud hud-br" id="hudHint">Click photo to focus · wheel to zoom · <kbd>Space</kbd> original</div>
 
     <div class="focus-ring" id="focusRing" hidden></div>
 
@@ -148,9 +148,15 @@
 
         <div class="group-head tight">
           <h3>Highlight bokeh</h3>
-          <output class="readout" id="highlightOut">0.15</output>
+          <output class="readout" id="highlightOut">2.0 stops</output>
         </div>
-        <input type="range" id="highlight" min="0" max="100" value="15" />
+        <input type="range" id="highlight" min="0" max="100" value="40" />
+
+        <div class="group-head tight">
+          <h3>Grain</h3>
+          <output class="readout" id="grainOut">0.30</output>
+        </div>
+        <input type="range" id="grain" min="0" max="100" value="30" />
       </section>
 
       <section class="group" id="depthGroup">
