@@ -303,6 +303,12 @@ def main() -> None:
                   out.push([x, 300, +read(d.S.targets.nearBlur, x, 300)[3].toFixed(3)]);
                 return out;
               }})(),
+              dense: (() => {{
+                const out = [];
+                for (let y = 160; y <= 215; y += 2)
+                  out.push([500, y, +read(d.S.targets.nearBlur, 500, y)[3].toFixed(3)]);
+                return out;
+              }})(),
               edgeAlpha: (() => {{
                 const out = [];
                 for (let x = 150; x <= 260; x++) out.push(+read(d.S.targets.nearBlur, x, 360)[3].toFixed(3));

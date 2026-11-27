@@ -53,8 +53,8 @@ everything else is client-side.
   (even textured) spreads through the middle and is left smooth. The mock now
   has a textured 0.7–2.2 m ground plane (snap equals raw depth at three points)
   and a 9 px 2–4 m ramp with plateaus. On the ramp, six of the nine samples
-  snap to a plateau at y = 590, and 146 of 270 ramp pixels change overall: about two
-  mixed pixels per interior row remain and the row ends do not snap. The snap
+  snap to a plateau at y = 590, and 146 of 270 ramp pixels change overall: one mixed pixel
+  remains at y = 590 and the row ends do not snap. The snap
   reduces a guided outline but does not erase every mixed pixel. It is built once per photo, not
   per focus tick. It is
   stored in **photo orientation** (the FBO row is flipped once in `SNAP_FRAG`);
@@ -167,13 +167,12 @@ On an RTX 4070 SUPER (12 GB), with the real Depth Pro 2 H+ weights and the real
 client (not the mock):
 
 - Model load 9.2 s warm; 1920×1440 analysis 0.70 s; 5656×4242 standalone
-  `test_backend.py` analysis 3.11 s (the app's 1.3 s is a cached meta value, not a measurement);
+  `test_backend.py` cold analysis 3.11 s;
   inference 0.76 s, refine 0.14 s. The reported 3.96 GB peak is read before
   `guided_upsample`; the refine pass is not separately sampled.
 - 5656×4242 export: 21.9 MB PNG, 4.0 s wall with a **cached** analysis;
-  the cold standalone analysis is 3.11 s; tiled vs non-tiled **0.000 / 0.0**. `nvidia-smi` sampled 2.8 GiB
-  total during the export, but the texture accounting plus the resident model
-  is about 3.7 GB; the 6 GB fit is not measured.
+  the cold standalone analysis is 3.11 s; tiled vs non-tiled **0.000 / 0.0**. the texture accounting plus the resident model is about 3.7 GB; the 6 GB
+  fit is not measured.
 - `cdp_test.py` browser suite against the real model server: **ok: true**, no
   failures; export 1920×1440; click-to-focus while zoomed works. WebGL ran on
   SwiftShader in that suite. Zoom anchor drift is a 3.7 code **sum** over three

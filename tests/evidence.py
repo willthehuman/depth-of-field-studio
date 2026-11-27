@@ -20,7 +20,7 @@ import numpy as np
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-PORT = 7861
+PORT = 7862
 TMP = Path.home() / ".cache" / "dof-evidence"
 TMP.mkdir(parents=True, exist_ok=True)
 
@@ -32,7 +32,8 @@ def sha(path: Path) -> str:
 def run(name: str, args: list[str]) -> tuple[Path, dict]:
     out = TMP / f"{name}.png"
     cmd = [sys.executable, str(ROOT / "tests" / "render_probe.py"),
-           "--out", str(out), "--port", str(PORT), *args]
+           "--out", str(out), "--port", str(PORT),
+           "--profile", str(TMP / "profile"), *args]
     p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=900)
     if p.returncode != 0:
         print(p.stdout[-3000:], p.stderr[-3000:])
@@ -42,7 +43,11 @@ def run(name: str, args: list[str]) -> tuple[Path, dict]:
         i = p.stdout.find('{"out"')
     if i < 0:
         raise SystemExit(f"probe {name}: no JSON in stdout: {p.stdout[-1000:]}")
-    return out, json.loads(p.stdout[i:])
+    data = json.loads(p.stdout[i:])
+    meta = data.get("result", {}).get("meta", {})
+    if meta.get("width") not in (None, 960) or meta.get("height") not in (None, 640):
+        raise SystemExit(f"probe {name}: expected the 960x640 mock, got {meta}")
+    return out, data
 
 
 def L(p: Path) -> np.ndarray:
@@ -147,6 +152,9 @@ def main() -> None:
 
     ramp_snap = sum(1 for _, raw, snap in c['ramp'] if abs(raw - snap) > 1e-4)
     ramp_total = len(c['ramp'])
+    dense = c["dense"]
+    dense_vals = [a for _, _, a in dense]
+    dense_sub = sum(1 for a in dense_vals if a < 0.5)
     near = c["nearAlpha"]
     near_rows = [a for x, y, a in near if y <= 209]
     near_rect = [a for x, y, a in near if y == 300 and x >= 620]
@@ -172,6 +180,7 @@ own mock server on port {PORT}.
 | `blur = 0`, 960x640 export vs original | mean {d_b0.mean():.3f}, max {d_b0.max():.1f} |
 | Near alpha edge, 10-90% | {x90 - x10} px (x {x10}->{x90}) |
 | Near alpha sample rows | {min(near_rows):.3f} to {max(near_rows):.3f} (six samples) |
+| Dense near alpha x=500, y=160-215 | {min(dense_vals):.3f} to {max(dense_vals):.3f}; {dense_sub}/{len(dense_vals)} below 0.5 |
 | Near alpha 4 m rectangle | {min(near_rect):.3f} to {max(near_rect):.3f} |
 | Highlight core | {hlp[293:353, 273:333].max(axis=(0, 1)).astype(int).tolist()} preview / {hle[290:350, 270:330].max(axis=(0, 1)).astype(int).tolist()} export |
 | Preview vs export (960) | {d_prev.mean():.3f} / 255 mean, p99 {np.percentile(d_prev, 99):.2f} |
@@ -220,6 +229,7 @@ venv/bin/python app.py
 venv/bin/python test_backend.py static/big.jpg
 python3 tests/render_probe.py --out /tmp/r.png --real-image /big.jpg --gpu --focus 8 --fstop 3 --lens 135 --taps 192 --highlight 0.4 --grain 0.3 --export-ui --download-dir /tmp/dof-dl
 python3 tests/render_probe.py --out /tmp/r04.png --real-image /big.jpg --gpu --focus 8 --fstop 3 --lens 135 --taps 96 --highlight 0.4 --grain 0.3 --preview-scale 0.4
+python3 tests/render_probe.py --out /tmp/r_notile.png --real-image /big.jpg --gpu --focus 8 --fstop 3 --lens 135 --taps 192 --highlight 0.4 --grain 0.3 --export --no-tile
 python3 cdp_test.py
 ```
 

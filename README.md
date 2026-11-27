@@ -10,7 +10,7 @@ forever.
 
 ## Install
 
-Needs **Python ≥ 3.11** and an NVIDIA GPU with ~4 GB free (it runs on CPU too, slowly).
+Needs **Python ≥ 3.11** and an NVIDIA GPU with ~4 GB free for the model at preview sizes (~6 GB for a 24 MP export with the browser and CUDA contexts; it runs on CPU too, slowly).
 
 ```bat
 git clone https://github.com/apple-aiml-research/ml-depth-pro-2.git repo
@@ -46,7 +46,7 @@ launches take 9.2 s warm (53.8 s cold) to build the model on the CPU and hand it
 
 | | |
 |---|---|
-| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. 0.70 s at 1920×1440, 3.11 s at 5656×4242 (24 MP, standalone `test_backend.py`; the 3.96 GB peak is before the refine pass). The DOF gathers fetch depth with nearest sampling and a min/max nearest-colour snap, so the filter's ~9 px mixed-depth ramp is reduced by the snap, but about two mixed pixels per interior row remain and the ramp ends do not snap. |
+| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. 0.70 s at 1920×1440, 3.11 s at 5656×4242 (24 MP, standalone `test_backend.py`; the 3.96 GB peak is before the refine pass). The DOF gathers fetch depth with nearest sampling and a min/max nearest-colour snap, so the filter's ~9 px mixed-depth ramp is reduced by the snap, but one mixed pixel remains on the y = 590 ramp row and the ramp ends do not snap. |
 | **Focus** | Slider, *Auto* (median of the centre), *Centre*, or click anywhere in the photo. Distances are in metres, straight from the model. |
 | **Aperture** | f/1.0 → f/22 in third stops. |
 | **Lens** | *Native* uses the focal length the model estimates; 50/85/135 mm simulate a longer lens, which is how you get a portrait look out of a wide-angle frame. |
@@ -71,14 +71,12 @@ anyway) and keeps the depth head and focal estimator in float32. The resident
 encoder/decoder is about 1.8 GB. Inference peaks at 3.96 GB at 1280 px on the
 12 GB card; `probe_sizes.py` reports the cost of a 1536 px inference size (`set DEPTH_SIDE=1536` to try it; not re-run here). A 5656×4242
 photo analysed in 3.1 s (standalone backend) and exported in 4.0 s wall; tiled
-and non-tiled exports are pixel-identical. `nvidia-smi` sampled 2.8 GiB total
-during the export, but the texture accounting plus the resident model is about
-3.7 GB; the 6 GB fit is not measured.
+and non-tiled exports are pixel-identical. The texture accounting plus the
+resident model is about 3.7 GB; the 6 GB fit is not measured.
 
 The two-field renderer keeps four canvas-sized float layer textures plus their
 mips, two blur targets, the full-resolution linear photo and the full-resolution
-radiance texture. At 24 MP the `nvidia-smi` sample was 2.8 GiB, while the texture accounting plus
-the resident model is about 3.7 GB. It fits on the 12 GB card; the 6 GB target
+radiance texture. At 24 MP the texture accounting plus the resident model is about 3.7 GB. It fits on the 12 GB card; the 6 GB target
 remains an estimate, not a measurement, and an 8192 px export can exceed either. The export is drawn in ≤ 2 MP bands with a flush between draws to stay
 under the Windows TDR limit.
 
@@ -120,7 +118,7 @@ weights.
   √(c² − c_native²) when EXIF gives the source aperture, but that is a
   heuristic, not a deconvolution.
 * The blur radius is capped at 10% of the short side of the frame. On a 24 MP
-  export that is 400 px, above the physical CoC for the built-in lens presets at
+  export that is 424 px at 4242, above the physical CoC for the built-in lens presets at
   their widest and longest settings.
 
 ## Licence
