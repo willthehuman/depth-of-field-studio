@@ -111,6 +111,8 @@ def main() -> None:
     ap.add_argument("--preview-scale", type=float, default=1.0,
                     help="render the non-export frame at this fraction of the photo size")
     ap.add_argument("--mode", type=int, default=0)
+    ap.add_argument("--coin-debug", action="store_true",
+                    help="read the near/far blur texels at the mock coin centre")
     args = ap.parse_args()
 
     server = subprocess.Popen([sys.executable, str(ROOT / "tests" / "mock_depth_server.py"),
@@ -204,6 +206,42 @@ def main() -> None:
           }}
           d.render({args.taps}, {str(args.export).lower()} && !{str(args.no_tile).lower()});
           const glErr = d.S.gl.getError();
+          let coin = null;
+          if ({str(args.coin_debug).lower()} && d.S.targets) {{
+            const gl = d.S.gl;
+            const read = (tex, x, y) => {{
+              const fb = gl.createFramebuffer();
+              gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+              gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+              const p = new Float32Array(4);
+              gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, p);
+              gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+              gl.deleteFramebuffer(fb);
+              return Array.from(p);
+            }};
+            const readLevel = (tex, level, x, y) => {{
+              const fb = gl.createFramebuffer();
+              gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+              gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, level);
+              const p = new Float32Array(4);
+              gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, p);
+              gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+              gl.deleteFramebuffer(fb);
+              return Array.from(p);
+            }};
+            coin = {{
+              nearBottom: read(d.S.targets.nearBlur, 647, 141),
+              farBottom: read(d.S.targets.farBlur, 647, 141),
+              nearTop: read(d.S.targets.nearBlur, 647, 506),
+              farTop: read(d.S.targets.farBlur, 647, 506),
+              nearMip3: readLevel(d.S.targets.nearColour, 3, 80, 63),
+              nearMip4: readLevel(d.S.targets.nearColour, 4, 40, 31),
+              nearMip5: readLevel(d.S.targets.nearColour, 5, 20, 15),
+              depth500: read(d.S.tex.depthSnap, 640, 500),
+              depth100: read(d.S.tex.depthSnap, 640, 100),
+              depth360: read(d.S.tex.depthSnap, 330, 360),
+            }};
+          }}
           const data = c.toDataURL('image/png');
           if ({str(args.export).lower()}) {{
             c.width = prevW;
@@ -214,7 +252,7 @@ def main() -> None:
             data,
             w: c.width, h: c.height,
             focus: d.S.focus, fstop: d.S.fstopIdx, lens: d.S.lensMM,
-            glErr,
+            glErr, coin,
             meta: {{width: d.S.meta.width, height: d.S.meta.height, f_px: d.S.meta.f_px}},
           }};
         }})()"""

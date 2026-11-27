@@ -33,7 +33,10 @@ everything else is client-side.
   texture; the layer, blur and final `texelFetch` it instead of repeating the
   search seven times per frame. The snap takes the min/max depth and chooses
   the extreme whose colour is closest, only when the centre sits inside the
-  mixed band.
+  mixed band. It is stored in **photo orientation** (the FBO row is flipped
+  once in `SNAP_FRAG`); every reader indexes `texelFetch(u_depthSnap, p, 0)`
+  top-down, so a bottom-of-frame near object is not classified with the top
+  plane's depth.
 * **Prefiltered taps.** The gather reads the layer mips at
   `log2(radius * sqrt(pi / taps))`, so 96/192 taps cover a 40–280 px disc
   without the mip-0 stipple.
@@ -94,9 +97,14 @@ unless stated:
   preview; the core means agree to ~1 code value. Preview versus export at
   highlight 1.0 is 0.69 / 255 mean absolute; the 480 px preview against the
   export downsampled to 480 is 0.66 / 255.
-* **Small object.** The 8 px near coin's source patch falls from 182.5 to
-  147.7 (R) when defocused at focus 8 m and spreads over the expected ~35 px
-  disc; the tile max keeps the full disc instead of truncating it.
+* **Small object.** The 8 px near coin's 16×16 centre is now **97.6/84.6/82.1**
+  (R/G/B) against the ~80 analytic; the near layer's alpha is 0.046, the depth
+  snap reads 0.6665 (1.5 m) and the near-coverage mips read 0.595 / 0.302 /
+  0.088 at levels 3/4/5. The earlier 94/187 flip-flop was the 5×5 snap being
+  written bottom-up: the coin was classified with the top plane's depth. The
+  alpha is now the plain aperture coverage, and the coin's PSF sees the near
+  source for only 4.6 % of the aperture. The flat near-disc centre still matches
+  the original at 172.7/172.6.
 * **Polygon.** At f/8 the specular bokeh edge radius varies 7.5–11 px around the
   disc; the 1.04 px std includes tap and 5 px source noise. The theoretical
   circumradius/inradius spread is ±0.35 px at that edge; measure the 9th angular

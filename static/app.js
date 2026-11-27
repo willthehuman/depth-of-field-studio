@@ -160,7 +160,11 @@ uniform sampler2D u_depth;
 uniform vec2 u_depthSize;
 
 void main() {
-  ivec2 p = ivec2(clamp(v_uv, 0.0, 1.0) * u_depthSize);
+  // FBO rows are bottom-up; store the snap in photo orientation like the
+  // PRE/RADIANCE/LAYER passes. Without this flip every reader sees the
+  // mirrored row and a bottom-band object is classified with the top depth.
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  ivec2 p = ivec2(clamp(uv, 0.0, 1.0) * u_depthSize);
   p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
   vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
   float dmin = 1e9, dmax = -1e9, cmin = 1e9, cmax = 1e9;
@@ -756,6 +760,10 @@ void main() {
     acc += vec4(selfCol * selfCov * selfW, selfCov * selfW);
   }
 
+  // The scatter-as-gather alpha is the aperture coverage. With the depth snap
+  // in photo orientation this is also the fraction of the destination PSF that
+  // sees the near source: ~0.05 at the 8 px coin, 1 deep inside the near disc
+  // and at its specular.
   float alpha = clamp(acc.a / max(shapeArea, 0.20), 0.0, 1.0);
   vec3 col = acc.rgb / max(acc.a, 1e-4);
   if (u_layer == 1) {
