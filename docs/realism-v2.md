@@ -17,7 +17,7 @@ everything else is client-side.
   premultiplied colour; the final pass is Porter-Duff `over`
   (`n.rgb + f.rgb * (1 - n.a)`). The old mix of premultiplied early-outs and
   straight gather colours darkened an in-focus subject to 0.75× linear; the
-  flat-disc test now matches the original to 173.3/55.8/38.2 code values (20×20 patch).
+  flat-disc test now matches the original to 173.3/55.8/38.2 code values (20×20 patch); the original is 172.5/52.9/36.6.
 * **Coverage alpha from mip 0.** The colour is prefiltered to the tap spacing,
   but coverage and the source's own CoC are read from mip 0. The coarse mip
   would smear the layer's coverage outward and turn the alpha into an opaque
@@ -28,7 +28,7 @@ everything else is client-side.
   `4·srad²` — near content just in front of the focus plane went 20–80 %
   transparent to the far fill (rows 165–191 of the mock read 0.21–0.98). The
   0.5 px floor and the 24-tap inner set cover that case; the same rows read
-  0.96–1.0 and the 4 m rectangle reads 0.99–1.0. An always-on self tap was
+  0.96–1.0 and the 4 m rectangle reads 1.0. An always-on self tap was
   removed after it proved unreachable (`selfRadE >= firstR` in every branch).
 * **Near-over-near ordering.** Taps whose source is nearer than the destination
   (`sd > d`) go to a separate `fg` bucket. The occlusion is normalised,
@@ -127,7 +127,7 @@ unless stated:
   57 codes at the clipped specular because result mode resamples in linear light
   while original mode resamples in sRGB; that was a harness artefact, not the
   renderer. Focus exactly on the near disc at 1.5 m: the 120 px near patch is
-  173.3/55.8/38.2 (R/G/B) versus 172.6/53.5/37.0 for the original; the G/B gap is ~2/255.
+  173.3/55.8/38.2 (R/G/B) versus 172.5/52.9/36.6 for the original; the G/B gap is ~3/255.
 * **Near edge.** The linear `nearBlur.a` 10–90% transition along y = 360 runs
   x 181→229: **48 px**, within 2 % of the 49 px hard-disc (pillbox) prediction
   (1.37 R). The earlier 36 px figure was the colour transition, not the alpha;
@@ -148,7 +148,7 @@ unless stated:
   = 0.0998 linear ≈ 89 sRGB, with the 16×16 mean 90.7 because the patch includes
   the brighter coin edge. The +10 codes against 80 are the near layer's own red
   (0.716 straight × 0.045), not a far-fill error. The flat near-disc centre still
-  matches the original at 173.3/172.6.
+  matches the original at 173.3/172.5.
 * **Polygon.** At f/8 the per-angle specular bokeh edge radius varies 7.5–11 px
   (std 1.02). The 9th angular harmonic
   is 0.18 px, so this 5 px source cannot isolate the 9-gon; the polygon is

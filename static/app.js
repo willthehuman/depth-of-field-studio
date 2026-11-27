@@ -148,9 +148,10 @@ void main() {
   // Snap the guided filter's mixed-depth ramp once per photo, at the depth
   // resolution, with a 9x9 window. The gathers then read a single R16F texture
   // instead of running the search in seven passes per frame. The window must be
-  // wider than the guided ramp (about 9 px at 24 MP); a 5x5 window turned the
-  // ramp into a staircase. Snapping also requires a real adjacent jump and a
-  // visible CoC difference, so steep smooth slopes are left alone.
+  // A 17 px, stride-2 window covers the guided filter's ramp (about 9 px at
+  // 24 MP); the old 5x5 window turned it into a staircase. Snapping also
+  // requires near/middle/far proportions and a colour edge, so a textured
+  // planar slope is left alone.
   const SNAP_FRAG = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -282,7 +283,7 @@ float baseLod() {
   return max(0.0, log2(1.0 / max(u_scale, 1e-4)));
 }
 
-// Depth lookup with a 3x3 nearest-colour snap. The guided filter leaves a
+// Depth lookup with the 17 px stride-2 nearest-colour snap. The guided filter leaves a
 // 2-4 px ramp of mixed 1/z at a silhouette; bilinear reads of that ramp paint
 // a sharp outline when it crosses the focus plane. Take the neighbour whose
 // colour is closest to the centre instead, and break ties towards the foreground.
@@ -504,10 +505,8 @@ void main() {
   ivec2 t = ivec2(uv * u_tileCount);
   t = clamp(t, ivec2(0), ivec2(u_tileCount) - 1);
   float m = 0.0;
-  for (int dy = -48; dy <= 48; dy++) {
-    if (abs(dy) > u_ntiles) continue;
-    for (int dx = -48; dx <= 48; dx++) {
-      if (abs(dx) > u_ntiles) continue;
+  for (int dy = -u_ntiles; dy <= u_ntiles; dy++) {
+    for (int dx = -u_ntiles; dx <= u_ntiles; dx++) {
       ivec2 q = clamp(t + ivec2(dx, dy), ivec2(0), ivec2(u_tileCount) - 1);
       float qmax = textureLod(u_tileTex, (vec2(q) + 0.5) / u_tileCount, 0.0).r * u_infoScale;
       // Only dilate into tiles whose own CoC can actually reach this one.
@@ -557,7 +556,6 @@ uniform int u_taps;
 uniform float u_zoom;
 uniform vec2 u_center;
 
-const int MAXTAPS = 192;
 const float GOLDEN = 2.399963229728653;
 const float PI = 3.14159265359;
 const float TAU = 6.28318530718;
@@ -765,14 +763,13 @@ void main() {
     : PI * radius * radius / float(u_taps);
   vec4 acc = vec4(0.0);
   vec4 fg = vec4(0.0);   // taps whose source is nearer than the destination
-  // The tap set leaves an untapped hole of this radius at the centre.
-  float hole = radius * sqrt(0.5 / float(u_taps));
-  // Hidden far destinations reject every tap; skip the whole gather and go
-  // straight to the fill.
+  // A destination whose CoC is below the tap spacing would get no sample from
+  // the outer ring; the inner set below covers it. The tap set has no centre
+  // sample, so the 0.5 px sradE floor is what keeps a nearly-sharp source
+  // opaque.
   bool skipGather = u_layer == 1 && textureLod(u_layerTex, uv, 0.0).a <= 0.02;
 
-  for (int i = 0; i < MAXTAPS; i++) {
-    if (i >= u_taps) break;
+  for (int i = 0; i < u_taps; i++) {
     if (skipGather) break;
     float r;
     float tapArea;
@@ -1083,7 +1080,7 @@ void main() {
   }
 
   // Snap the guided-filter ramp once, at the depth resolution. The layers read
-  // this texture with texelFetch; the 5x5 search no longer runs per pass.
+  // this texture with texelFetch; the 9x9 search no longer runs per pass.
   function buildDepthSnap(w, h) {
     const gl = S.gl;
     S.snapOK = false;
@@ -1897,13 +1894,22 @@ void main() {
   async function exportDepth() {
     if (!S.meta || S.busy) return;
     S.busy = true;
+    let failed = false;
     try {
       await exportRender({ mode: 1, mime: "image/png", ext: "png", taps: 1, tag: "depth" });
     } catch (e) {
+      failed = true;
       console.error(e);
+      if (S.gl.isContextLost()) {
+        overlay(true, "GPU context lost",
+          "The browser reset the GPU. Reload the page to rebuild the textures.", 100);
+      } else {
+        overlay(true, "Export failed", String(e.message || e), 100);
+        setTimeout(() => overlay(false), 4000);
+      }
     } finally {
       S.busy = false;
-      overlay(false);
+      if (!failed && !S.gl.isContextLost()) overlay(false);
     }
   }
 
@@ -2199,7 +2205,14 @@ void main() {
 
   /* --------------------------------------------------------------------- boot */
 
-  initGL();
+  try {
+    initGL();
+  } catch (e) {
+    console.error(e);
+    overlay(true, "Renderer failed",
+      `WebGL could not start: ${e.message || e}. Try a recent Chrome, Edge or Firefox.`, 100);
+    return;
+  }
   wire();
   $("panel").classList.add("empty-state");
   $("view").classList.add("hidden");

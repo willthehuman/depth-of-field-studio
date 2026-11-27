@@ -266,6 +266,8 @@ def main() -> None:
               depth500: read(d.S.tex.depthSnap, 640, 500),
               depth100: read(d.S.tex.depthSnap, 640, 100),
               depth360: read(d.S.tex.depthSnap, 330, 360),
+              coinPixel: read(d.S.targets.nearBlur, 640, 500),
+              coinFar: read(d.S.targets.farBlur, 640, 500),
               slope: [[120, 520], [200, 560], [270, 610]].map(([x, y]) => [
                 x, y, +read(d.S.tex.depth, x, y)[0].toFixed(5),
                 +read(d.S.tex.depthSnap, x, y)[0].toFixed(5),
@@ -275,6 +277,24 @@ def main() -> None:
                 return [x, +read(d.S.tex.depth, x, 590)[0].toFixed(5),
                         +read(d.S.tex.depthSnap, x, 590)[0].toFixed(5)];
               }}),
+              slopeDiff: (() => {{
+                let n = 0, total = 0;
+                for (let y = 500; y < 620; y += 5) for (let x = 80; x < 280; x += 5) {{
+                  total++;
+                  if (Math.abs(read(d.S.tex.depth, x, y)[0] -
+                               read(d.S.tex.depthSnap, x, y)[0]) > 1e-4) n++;
+                }}
+                return [n, total];
+              }})(),
+              rampDiff: (() => {{
+                let n = 0, total = 0;
+                for (let y = 560; y < 620; y += 2) for (let x = 380; x <= 388; x++) {{
+                  total++;
+                  if (Math.abs(read(d.S.tex.depth, x, y)[0] -
+                               read(d.S.tex.depthSnap, x, y)[0]) > 1e-4) n++;
+                }}
+                return [n, total];
+              }})(),
               nearAlpha: (() => {{
                 const out = [];
                 for (const y of [40, 100, 140, 170, 190, 205, 300, 400, 520, 600])
