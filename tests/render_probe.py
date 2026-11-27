@@ -96,7 +96,12 @@ def main() -> None:
     ap.add_argument("--fstop", type=int, default=3, help="index into FSTOPS (3 = f/1.4)")
     ap.add_argument("--lens", type=float, default=135.0, help="0 = native, else mm")
     ap.add_argument("--blur", type=float, default=1.0)
+    ap.add_argument("--highlight", type=float, default=0.4, help="0..1 -> 0..5 stops")
+    ap.add_argument("--grain", type=float, default=0.3)
     ap.add_argument("--taps", type=int, default=96)
+    ap.add_argument("--zoom", type=float, default=1.0)
+    ap.add_argument("--cx", type=float, default=0.5)
+    ap.add_argument("--cy", type=float, default=0.5)
     ap.add_argument("--export", action="store_true")
     ap.add_argument("--mode", type=int, default=0)
     args = ap.parse_args()
@@ -136,7 +141,12 @@ def main() -> None:
           d.S.fstopIdx = {args.fstop};
           d.S.lensMM = {args.lens};
           d.S.blur = {args.blur};
+          d.S.highlight = {args.highlight};
+          d.S.grain = {args.grain};
           d.S.mode = {args.mode};
+          d.S.zoom = {args.zoom};
+          d.S.cx = {args.cx};
+          d.S.cy = {args.cy};
           d.S.holdOriginal = false;
           d.updateFocusUI();
           d.updateLensUI();

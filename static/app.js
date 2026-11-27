@@ -14,8 +14,6 @@
     5.6, 6.3, 7.1, 8.0, 9.0, 10, 11, 13, 14, 16, 18, 20, 22];
   const PREVIEW_TAPS = 96;
   const EXPORT_TAPS = 192;
-  const MAX_WORK_PIXELS = 6_000_000;
-  const MAX_WORK_SIDE = 8192;
   const COC_LIMIT = 0.03; // 30 µm, the full-frame circle of confusion
 
   const S = {
@@ -28,13 +26,21 @@
     dLo: 0.3,
     dHi: 40,
     blur: 1,
-    highlight: 0.15,
+    highlight: 0.4,
+    grain: 0.30,
     lensMM: 0,
+    zoom: 1,
+    cx: 0.5,
+    cy: 0.5,
+    drag: null,
+    suppressClick: false,
     format: "jpeg",
     quality: 95,
     depthLow: null,
     lowW: 0,
     lowH: 0,
+    depthW: 0,
+    depthH: 0,
     gl: null,
     progPre: null,
     progFinal: null,
@@ -65,7 +71,10 @@ void main() {
 }`;
 
   // Pre-pass: decode the sRGB photo into a linear-light texture, once per
-  // photo, and build the source mip pyramid in linear space.
+  // photo, and build the source mip pyramid in linear space. Alpha carries the
+  // clipping mask: 1 where the source is at or above display white. The
+  // highlight expansion reads it later, and its mip pyramid gives the local
+  // clip fraction that separates a small specular from a white sky.
   const PRE_FRAG = `#version 300 es
 precision highp float;
 
@@ -84,12 +93,15 @@ void main() {
   // Framebuffer rows are bottom-up while v_uv is top-down for the on-screen
   // pass. Flip here so this texture has the same orientation as the photo.
   vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
-  outColor = vec4(srgbToLinear(texture(u_src, uv).rgb), 1.0);
+  vec3 c = srgbToLinear(texture(u_src, uv).rgb);
+  float clipped = smoothstep(0.90, 0.995, max(c.r, max(c.g, c.b)));
+  outColor = vec4(c, clipped);
 }`;
 
   // The final pass doubles as the original/depth preview. In DOF mode the
-  // near layer is premultiplied and the far layer has been filled by its mip
-  // pyramid, so the physical order is simply near over far.
+  // near field carries coverage alpha and composites over the far field, which
+  // is filled behind the near objects. Grain is added in linear light where the
+  // defocus is strong enough to have erased the source noise.
   const FINAL_FRAG = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -99,23 +111,25 @@ out vec4 outColor;
 
 uniform sampler2D u_photo;
 uniform sampler2D u_depth;
+uniform sampler2D u_near;
+uniform sampler2D u_far;
+uniform vec2 u_depthSize;
 uniform float u_fpxNative;
 uniform float u_fmm;
 uniform float u_fstop;
 uniform float u_focus;
 uniform float u_scale;
 uniform float u_blur;
-uniform float u_maxblur;
-uniform float u_highlight;
+uniform float u_maxRadius;
+uniform float u_grain;
 uniform float u_dnear;
 uniform float u_dfar;
 uniform int u_mode;
 uniform int u_linear;
-uniform int u_taps;
 uniform vec2 u_res;
+uniform float u_zoom;
+uniform vec2 u_center;
 
-const int MAXTAPS = 192;
-const float GOLDEN = 2.399963229728653;
 const float PI = 3.14159265359;
 
 vec3 linearToSrgb(vec3 c) {
@@ -129,17 +143,6 @@ vec3 encode(vec3 c) {
   return u_linear == 1 ? linearToSrgb(c) : c;
 }
 
-
-
-
-
-float ign(vec2 p) {
-  return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
-}
-
-// d = inverse depth (1/m). u_focus in m, u_fmm = simulated focal (mm),
-// u_fpxNative = the photo's own focal length in pixels. Returns CoC diameter
-// in target pixels. Linear in u_fmm (no quadratic), exact thin-lens mag term.
 float cocDiameter(float d) {
   float s = clamp(u_focus, 0.05, 4000.0);
   float smm = s * 1000.0;
@@ -147,6 +150,45 @@ float cocDiameter(float d) {
   float c = (u_fpxNative * u_fmm / max(u_fstop, 0.7))
           * abs(d - 1.0 / s) * 0.001 * mag;
   return c * u_blur * u_scale;
+}
+
+vec2 zoomUV(vec2 uv) {
+  return clamp(u_center + (uv - 0.5) / u_zoom, vec2(0.0), vec2(1.0));
+}
+
+float baseLod() {
+  return max(0.0, log2(1.0 / max(u_scale, 1e-4)));
+}
+
+// Depth lookup with a 3x3 nearest-colour snap. The guided filter leaves a
+// 2-4 px ramp of mixed 1/z at a silhouette; bilinear reads of that ramp paint
+// a sharp outline when it crosses the focus plane. Take the neighbour whose
+// colour is closest to the centre instead, and break ties towards the foreground.
+float depthAt(vec2 puv) {
+  ivec2 p = ivec2(clamp(puv, 0.0, 1.0) * u_depthSize);
+  p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
+  vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
+  float bestD = texelFetch(u_depth, p, 0).r;
+  float bestDist = 1e9;
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
+      vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
+      float dist = dot(c0 - c, c0 - c);
+      float d = texelFetch(u_depth, q, 0).r;
+      if (dist < bestDist - 1e-7 || (abs(dist - bestDist) <= 1e-7 && d > bestD)) {
+        bestDist = dist;
+        bestD = d;
+      }
+    }
+  }
+  return bestD;
+}
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
 }
 
 vec3 depthRamp(float t) {
@@ -164,20 +206,17 @@ vec3 depthRamp(float t) {
 }
 
 void main() {
-  vec3 base = textureLod(u_photo, v_uv, 0.0).rgb;
+  vec2 puv = zoomUV(v_uv);
+  vec3 base = textureLod(u_photo, puv, baseLod()).rgb;
   if (u_mode == 2) {
     outColor = vec4(encode(base), 1.0);
     return;
   }
 
-  float d = textureLod(u_depth, v_uv, 0.0).r;
   if (u_mode == 1) {
-    // The depth map is a data view: interpolate METRES, not disparity. A
-    // bilinear read of 1/z across a silhouette lands mid-ramp (fake orange
-    // fringe); averaging z instead blends toward the far value, which is what
-    // the eye expects at a depth discontinuity.
-    vec2 dsz = vec2(textureSize(u_depth, 0));
-    vec2 tuv = v_uv * dsz - 0.5;
+    // The depth map is a data view: interpolate METRES, not disparity.
+    vec2 dsz = u_depthSize;
+    vec2 tuv = puv * dsz - 0.5;
     ivec2 i0 = ivec2(floor(tuv));
     vec2 f = clamp(tuv - vec2(i0), 0.0, 1.0);
     ivec2 i1 = min(i0 + 1, ivec2(dsz) - 1);
@@ -193,44 +232,31 @@ void main() {
     return;
   }
 
-  float radius = 0.5 * min(cocDiameter(d), u_maxblur);
-  if (radius < 0.55) {
-    outColor = vec4(encode(base), 1.0);
-    return;
-  }
+  float d = depthAt(puv);
+  vec4 n = texture(u_near, v_uv);
+  vec4 f = texture(u_far, v_uv);
+  float a = clamp(n.a, 0.0, 1.0);
+  vec3 col = n.rgb * a + f.rgb * (1.0 - a);
 
-  // Single-pass scatter-as-gather: the shape that made the first commit look
-  // right. No mip pre-filter (discs stay crisp) and no layered compositing
-  // (no halo at the subject edge). A neighbour only contributes when its own
-  // blur disc reaches this pixel, so sharp foreground cannot bleed outward.
-  float spin = ign(gl_FragCoord.xy) * 6.2831853;
-  vec3 sum = base;
-  float wsum = 1.0;
+  // Grain: sensor noise is added after the lens, so it stays sharp in the
+  // source. The synthetic blur averages it out; put a matching amount back
+  // only where the blur is strong, with a shadow-weighted amplitude.
+  float radius = 0.5 * min(cocDiameter(d), u_maxRadius);
+  float grain = smoothstep(0.75, 4.0, radius) * u_grain;
+  float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+  float n1 = hash12(gl_FragCoord.xy);
+  float n2 = hash12(gl_FragCoord.xy + vec2(17.0, 31.0));
+  col += vec3((n1 - 0.5), (n1 - 0.5) * 0.7, (n2 - 0.5)) * grain
+       * (0.35 + 0.65 * (1.0 - clamp(luma, 0.0, 1.0)));
 
-  for (int i = 0; i < MAXTAPS; i++) {
-    if (i >= u_taps) break;
-    float fi = float(i) + 0.5;
-    float r = sqrt(fi / float(u_taps)) * radius;
-    float a = fi * GOLDEN + spin;
-    vec2 suv = clamp(v_uv + vec2(cos(a), sin(a)) * r / u_res, vec2(0.0), vec2(1.0));
-
-    vec3 sc = textureLod(u_photo, suv, 0.0).rgb;
-    float sd = textureLod(u_depth, suv, 0.0).r;
-    float srad = 0.5 * min(cocDiameter(sd), u_maxblur);
-    float w = smoothstep(r - 1.5, r + 1.5, srad);
-
-    // Specular emphasis, the way a fast lens lifts point highlights.
-    w *= 1.0 + u_highlight * smoothstep(0.55, 0.95, max(sc.r, max(sc.g, sc.b)));
-
-    sum += sc * w;
-    wsum += w;
-  }
-  outColor = vec4(encode(sum / wsum), 1.0);
+  outColor = vec4(encode(col), 1.0);
 }`;
 
   // Split the photo into premultiplied near/far layers. RGB is filtered as
   // coverage-weighted colour and A is coverage. The second output is
-  // radius*coverage, which becomes the layer's CoC pyramid.
+  // radius*coverage, which becomes the layer's CoC pyramid. The layer is the
+  // blur source, so clipped highlights are expanded here, gated on clipping and
+  // isolation and faded in with the blur radius; the sharp base stays unexpanded.
   const LAYER_FRAG = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -240,22 +266,31 @@ out vec4 outColor;
 
 uniform sampler2D u_photo;
 uniform sampler2D u_depth;
+uniform vec2 u_depthSize;
 uniform float u_fpxNative;
 uniform float u_fmm;
 uniform float u_fstop;
 uniform float u_focus;
 uniform float u_scale;
 uniform float u_blur;
-uniform float u_highlight;
-uniform float u_maxblur;
+uniform float u_maxRadius;
+uniform float u_hlStops;
 uniform float u_infoScale;
 uniform int u_layer;
 uniform int u_info;
 uniform int u_linear;
+uniform float u_zoom;
+uniform vec2 u_center;
 
-// d = inverse depth (1/m). u_focus in m, u_fmm = simulated focal (mm),
-// u_fpxNative = the photo's own focal length in pixels. Returns CoC diameter
-// in target pixels. Linear in u_fmm (no quadratic), exact thin-lens mag term.
+vec2 zoomUV(vec2 uv) {
+  return clamp(u_center + (uv - 0.5) / u_zoom, vec2(0.0), vec2(1.0));
+}
+
+// Minified previews must read a prefiltered level of the photo, not mip 0.
+float baseLod() {
+  return max(0.0, log2(1.0 / max(u_scale, 1e-4)));
+}
+
 float cocDiameter(float d) {
   float s = clamp(u_focus, 0.05, 4000.0);
   float smm = s * 1000.0;
@@ -265,43 +300,59 @@ float cocDiameter(float d) {
   return c * u_blur * u_scale;
 }
 
-// Highlight bloom, gated by LOCAL contrast: a compact specular gains energy,
-// while a flat bright region (overcast sky, snow, a white wall) has no excess
-// over its own blurred neighbourhood and is left alone. A global boost here
-// clipped skies to white; a Karis compress/expand pair is exact on flat
-// regions but caps the slider at ~1.04-1.33x, so the slider did nothing.
-vec3 hdrExpand(vec3 c, vec2 uv, float spread) {
-  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-  float bg = dot(textureLod(u_photo, uv, 5.0).rgb, vec3(0.2126, 0.7152, 0.0722));
-  float excess = max(0.0, l - bg);
-  float t = smoothstep(0.02, 0.30, excess);
-  float gain = 1.0 + float(u_linear) * u_highlight * 12.0 * t * spread;
-  return c * gain;
+float depthAt(vec2 puv) {
+  ivec2 p = ivec2(clamp(puv, 0.0, 1.0) * u_depthSize);
+  p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
+  vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
+  float bestD = texelFetch(u_depth, p, 0).r;
+  float bestDist = 1e9;
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
+      vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
+      float dist = dot(c0 - c, c0 - c);
+      float d = texelFetch(u_depth, q, 0).r;
+      if (dist < bestDist - 1e-7 || (abs(dist - bestDist) <= 1e-7 && d > bestD)) {
+        bestDist = dist;
+        bestD = d;
+      }
+    }
+  }
+  return bestD;
 }
 
 void main() {
   vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
-  float d = textureLod(u_depth, uv, 0.0).r;
+  vec2 puv = zoomUV(uv);
+  float d = depthAt(puv);
   float dFocus = 1.0 / clamp(u_focus, 0.05, 4000.0);
   float band = max(dFocus * 0.02, 1e-4);
   float nearPart = smoothstep(dFocus - band, dFocus + band, d);
   float belongs = u_layer == 0 ? nearPart : 1.0 - nearPart;
-  float radius = 0.5 * min(cocDiameter(d), u_maxblur);
+  float radius = 0.5 * min(cocDiameter(d), u_maxRadius);
 
   if (u_info == 1) {
     outColor = vec4(radius * belongs / u_infoScale, 0.0, 0.0, 1.0);
     return;
   }
 
-  vec3 c = textureLod(u_photo, uv, 0.0).rgb;
-  c = hdrExpand(c, uv, smoothstep(0.5, 6.0, radius));
+  vec3 c = textureLod(u_photo, puv, baseLod()).rgb;
+  float clipped = textureLod(u_photo, puv, baseLod()).a;
+  float localClip = textureLod(u_photo, puv, 5.0 + baseLod()).a;
+  float spread = smoothstep(0.5, 4.0, radius);
+  float iso = 1.0 - smoothstep(0.15, 0.6, localClip);
+  c *= exp2(u_hlStops * clipped * iso * spread);
   outColor = vec4(c * belongs, belongs);
 }`;
 
   // Blur one layer using its own CoC field. The mip probe pulls a filled
   // radius and colour from coarser levels where the layer is occluded. The
-  // aperture is a fixed nine-blade polygon across the frame; the per-pixel
-  // phase changes sample placement, not the polygon's orientation.
+  // aperture is a nine-blade polygon whose roundness depends on the f-stop,
+  // with mechanical cat's-eye clipping toward the frame edge. The shape test is
+  // evaluated in the SOURCE frame (the destination relative to the source, with
+  // the near-field PSF point-reflected), not in the destination frame, and the
+  // weights are normalised by the aperture area so the near-field alpha is real
+  // coverage rather than an opaque average.
   const LAYER_BLUR_FRAG = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -311,7 +362,9 @@ out vec4 outColor;
 
 uniform sampler2D u_layerTex;
 uniform sampler2D u_infoTex;
+uniform sampler2D u_photo;
 uniform sampler2D u_depth;
+uniform vec2 u_depthSize;
 uniform vec2 u_res;
 uniform float u_fpxNative;
 uniform float u_fmm;
@@ -319,20 +372,28 @@ uniform float u_fstop;
 uniform float u_focus;
 uniform float u_scale;
 uniform float u_blur;
-uniform float u_maxblur;
+uniform float u_maxRadius;
 uniform float u_maxLod;
 uniform float u_infoScale;
 uniform int u_layer;
 uniform int u_taps;
+uniform float u_zoom;
+uniform vec2 u_center;
 
 const int MAXTAPS = 192;
 const float GOLDEN = 2.399963229728653;
 const float PI = 3.14159265359;
 const float TAU = 6.28318530718;
 
-// d = inverse depth (1/m). u_focus in m, u_fmm = simulated focal (mm),
-// u_fpxNative = the photo's own focal length in pixels. Returns CoC diameter
-// in target pixels. Linear in u_fmm (no quadratic), exact thin-lens mag term.
+vec2 zoomUV(vec2 uv) {
+  return clamp(u_center + (uv - 0.5) / u_zoom, vec2(0.0), vec2(1.0));
+}
+
+// Minified previews must read a prefiltered level of the photo, not mip 0.
+float baseLod() {
+  return max(0.0, log2(1.0 / max(u_scale, 1e-4)));
+}
+
 float cocDiameter(float d) {
   float s = clamp(u_focus, 0.05, 4000.0);
   float smm = s * 1000.0;
@@ -342,107 +403,181 @@ float cocDiameter(float d) {
   return c * u_blur * u_scale;
 }
 
+float depthAt(vec2 puv) {
+  ivec2 p = ivec2(clamp(puv, 0.0, 1.0) * u_depthSize);
+  p = clamp(p, ivec2(0), ivec2(u_depthSize) - 1);
+  vec3 c0 = textureLod(u_photo, (vec2(p) + 0.5) / u_depthSize, 0.0).rgb;
+  float bestD = texelFetch(u_depth, p, 0).r;
+  float bestDist = 1e9;
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(u_depthSize) - 1);
+      vec3 c = textureLod(u_photo, (vec2(q) + 0.5) / u_depthSize, 0.0).rgb;
+      float dist = dot(c0 - c, c0 - c);
+      float d = texelFetch(u_depth, q, 0).r;
+      if (dist < bestDist - 1e-7 || (abs(dist - bestDist) <= 1e-7 && d > bestD)) {
+        bestDist = dist;
+        bestD = d;
+      }
+    }
+  }
+  return bestD;
+}
+
 float ign(vec2 p) {
   return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
 
-float polygonLimit(float angle, float radius) {
+// Fixed 9-gon in image space. roundness=1 -> circle, 0 -> polygon. The polygon
+// is scaled so its area matches the circle's, keeping the coverage normalisation.
+float apertureLimit(float angle, float roundness) {
   const float blades = 9.0;
+  const float areaScale = 1.042; // 1 / sqrt(9-gon area / circle area)
   float sector = TAU / blades;
   float local = mod(angle + 0.17 + sector * 0.5, sector) - sector * 0.5;
-  return radius * cos(PI / blades) / max(cos(local), 0.20);
+  float poly = cos(PI / blades) / max(cos(local), 0.20);
+  return mix(poly * areaScale, 1.0, roundness);
+}
+
+float apertureShape(vec2 q, float srad, vec2 field, float fstop, float nearSign) {
+  float r = length(q);
+  float roundness = 1.0 - smoothstep(2.0, 4.0, fstop);
+  float limit = apertureLimit(atan(q.y, q.x), roundness);
+  float shape = smoothstep(1.0, 0.965, r / max(limit, 1e-3));
+
+  // Mechanical cat's eye: the pupil is clipped by an offset circle of a
+  // slightly smaller radius. The two radii differ, unlike the old dead code
+  // where the sign flip did nothing.
+  float fieldR = length(field);
+  float cat = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, fstop));
+  vec2 dir = field / max(fieldR, 1e-4);
+  float r2 = 1.0 - 0.22 * cat;
+  float clip2 = smoothstep(r2, r2 - 0.05, length(q - dir * (0.30 * cat)));
+  shape *= mix(1.0, clip2, cat);
+
+  // Mild spherical-aberration rim: bright rim on one side of focus, soft centre
+  // on the other. The coverage normalisation below makes it energy-neutral.
+  float rim = 1.0 + 0.10 * nearSign * (2.0 * pow(min(r, 1.0), 2.0) - 0.55);
+  return max(shape * rim, 0.0);
 }
 
 void main() {
   vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
-  float d = textureLod(u_depth, uv, 0.0).r;
+  vec2 puv = zoomUV(uv);
+  float d = depthAt(puv);
   float dFocus = 1.0 / clamp(u_focus, 0.05, 4000.0);
   float band = max(dFocus * 0.02, 1e-4);
   float nearPart = smoothstep(dFocus - band, dFocus + band, d);
   float belongs = u_layer == 0 ? nearPart : 1.0 - nearPart;
-  float radius = belongs > 0.5 ? 0.5 * min(cocDiameter(d), u_maxblur) : 0.0;
+  float own = belongs > 0.01 ? 0.5 * min(cocDiameter(d), u_maxRadius) : 0.0;
 
-  // Far layer: first covered mip fills occluded background (keep the break).
-  // Near layer: take the MAX radius across covered mips so a blurry foreground
-  // object is not cut off by a nearer, sharper pixel on top of it.
+  // Mip fill. The near layer takes the max radius across covered levels so a
+  // defocused foreground spreads outward. The far layer takes the first covered
+  // level: that is the background colour hidden behind the subject.
+  float fill = own;
+  vec4 fillCol = vec4(0.0);
   for (int probe = 0; probe < 12; probe++) {
     float lod = min(float(probe), u_maxLod);
-    float coverage = textureLod(u_layerTex, uv, lod).a;
-    if (coverage > 0.02) {
-      float packedRadius = textureLod(u_infoTex, uv, lod).r * u_infoScale;
-      float cand = packedRadius / max(coverage, 1e-4);
-      radius = max(radius, cand);
-      if (u_layer == 1) break;   // far: first hit is the fill we want
+    vec4 probeCol = textureLod(u_layerTex, uv, lod);
+    float cov = probeCol.a;
+    if (cov > 0.02) {
+      float pr = textureLod(u_infoTex, uv, lod).r * u_infoScale / max(cov, 1e-4);
+      fill = max(fill, pr);
+      if (probeCol.a > fillCol.a) {
+        fillCol = probeCol;
+      }
+      if (u_layer == 1) break;
     }
     if (lod >= u_maxLod) break;
   }
+  float radius = min(fill, u_maxRadius);
 
   if (radius < 0.55) {
-    vec4 direct = textureLod(u_layerTex, uv, 0.0);
     if (u_layer == 1) {
-      float coverage = smoothstep(0.0, 0.08, direct.a);
-      vec3 colour = direct.rgb / max(direct.a, 1e-4);
-      outColor = vec4(colour * coverage, coverage);
+      // The background is a full plane. If this pixel is covered by a near
+      // object, the probe found the surrounding background; use it so the
+      // composite never shows black behind a near edge.
+      float cov = smoothstep(0.0, 0.08, fillCol.a);
+      vec3 col = fillCol.rgb / max(fillCol.a, 1e-4);
+      outColor = vec4(col * cov, cov);
     } else {
-      outColor = direct;
+      outColor = textureLod(u_layerTex, uv, 0.0);
     }
     return;
   }
 
-  // Mechanical vignetting: the usable aperture shrinks toward the frame edge.
-  vec2 field = (uv - 0.5) * 2.0;
+  vec2 field = (puv - 0.5) * 2.0;
   field.x *= u_res.x / max(u_res.y, 1.0);
-  float wide = 1.0 - smoothstep(1.6, 8.0, u_fstop);
-
+  float fieldR = length(field);
+  float catDest = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, u_fstop));
+  // Full cat's-eye clipping (two unit circles offset by 0.30, r2 = 0.78) leaves
+  // 0.585 of the aperture. Divide the coverage alpha by the shape area so a
+  // vignetted pupil does not make an opaque foreground transparent at the edge.
+  float shapeArea = 1.0 - 0.415 * catDest;
   float spin = ign(gl_FragCoord.xy + vec2(float(u_layer) * 19.0, 0.0)) * TAU;
-  // Pre-filter to the actual tap spacing so blades stay crisp but noise-free:
-  // Vogel spacing ~ radius * sqrt(pi / taps); one mip texel is 2^lod.
   float lod = clamp(log2(max(1.0, radius * sqrt(PI / float(u_taps)))) - 0.5, 0.0, u_maxLod);
-  vec4 sum = vec4(0.0);
-  vec4 sumRaw = vec4(0.0);
-  float wsum = 0.0;
+  float A = PI * radius * radius / float(u_taps);
+  vec4 acc = vec4(0.0);
+
   for (int i = 0; i < MAXTAPS; i++) {
     if (i >= u_taps) break;
     float fi = float(i) + 0.5;
-    float angle = fi * GOLDEN + spin;
-    float limit = polygonLimit(angle, radius);
-    float r = sqrt(fi / float(u_taps)) * limit;
-    vec2 off = vec2(cos(angle), sin(angle)) * r / u_res;
-    // Mechanical vignetting: off-axis, the aperture is the intersection of two
-    // offset circles along the radial field vector -> almond ("cat's eye").
-    // off is in UV units; divide the PIXEL offset by the radius to get the
-    // tap's position in the unit aperture disc.
-    float rpx = length(off * u_res);
-    vec2 ap = vec2(cos(angle), sin(angle)) * (rpx / max(radius, 1e-3));
-    float vig = 0.55 * wide * smoothstep(0.2, 1.2, length(field));
-    vec2 radial = normalize(field + vec2(1e-4));
-    float sgn = u_layer == 0 ? 1.0 : -1.0;       // near/far clip opposite rims
-    float d1 = length(ap - sgn * vig * radial);
-    float d2 = length(ap + sgn * vig * radial);
-    float catW = smoothstep(1.0, 0.92, max(d1, d2));
-    vec2 sampleUV = clamp(uv + off, vec2(0.0), vec2(1.0));
-    vec4 s = textureLod(u_layerTex, sampleUV, lod);
-    // The sample's own CoC radius (packed radius / coverage). A tap only
-    // contributes if its blur disc actually reaches this pixel — this is what
-    // stops a sharp mid-ground object smearing into the far background.
-    float sCov = max(s.a, 1e-4);
-    float sRad = textureLod(u_infoTex, sampleUV, lod).r * u_infoScale / sCov;
-    float reach = smoothstep(r - 1.0, r + 1.0, sRad);
-    float w = reach * catW;
-    sum += s * w;
-    sumRaw += s;
-    wsum += w;
-  }
-  // If every tap was rejected (empty region of this layer), fall back to the
-  // unweighted average instead of dividing by ~zero.
-  sum = wsum > 1e-3 ? sum / wsum : sumRaw / float(u_taps);
+    float r = sqrt(fi / float(u_taps)) * radius;
+    float a = fi * GOLDEN + spin;
+    vec2 sUV = clamp(uv + vec2(cos(a), sin(a)) * r / u_res, vec2(0.0), vec2(1.0));
+    vec4 s = textureLod(u_layerTex, sUV, lod);
+    vec3 sc = s.rgb / max(s.a, 1e-4);
+    // Coverage and the source's own CoC come from mip 0, not from the
+    // prefiltered level: the coarse mip would smear the layer's coverage
+    // outward and defeat the coverage alpha. Only the colour is prefiltered.
+    vec4 s0 = textureLod(u_layerTex, sUV, 0.0);
+    float cov = max(s0.a, 1e-4);
+    float srad = textureLod(u_infoTex, sUV, 0.0).r * u_infoScale / cov;
+    float inside = smoothstep(r - 1.0, r + 1.0, srad);
 
+    // A source beyond the destination's own blur radius is only allowed to
+    // contribute if it is NEARER than the destination; otherwise a blurrier
+    // background would paint over the midground.
+    if (r > own + 1.0) {
+      vec2 puvS = zoomUV(sUV);
+      ivec2 sp = ivec2(clamp(puvS, 0.0, 1.0) * u_depthSize);
+      sp = clamp(sp, ivec2(0), ivec2(u_depthSize) - 1);
+      float sd = texelFetch(u_depth, sp, 0).r;
+      if (sd < d) inside = 0.0;
+    }
+
+    vec2 q = (uv - sUV) * u_res;
+    if (u_layer == 0) q = -q;             // near-field PSF is point-reflected
+    vec2 puvS = zoomUV(sUV);
+    vec2 fieldS = (puvS - 0.5) * 2.0;
+    fieldS.x *= u_res.x / max(u_res.y, 1.0);
+    float shape = apertureShape(q / max(srad, 1e-3), srad, fieldS,
+                                u_fstop, u_layer == 0 ? 1.0 : -1.0);
+    // The weight of a fully covered source must integrate to 1. wFull is the
+    // aperture-area share of this tap; inside is the fraction of the source's
+    // disc that reaches the destination. The near-field alpha is the covered
+    // share divided by the full aperture share, i.e. real coverage.
+    float wFull = shape * A / (PI * max(srad * srad, 0.25));
+    float w = inside * wFull;
+
+    acc += vec4(sc * cov * w, cov * w);
+  }
+
+  // A/(PI*srad^2) makes a fully covered source integrate to 1, so acc.a is
+  // the covered fraction of the aperture. The cat's-eye mask reduces the
+  // aperture area at the frame edge; divide by that area so an opaque subject
+  // stays opaque while the blur still carries the vignetting shape.
+  float alpha = clamp(acc.a / max(shapeArea, 0.20), 0.0, 1.0);
+  vec3 col = acc.rgb / max(acc.a, 1e-4);
   if (u_layer == 1) {
-    float coverage = smoothstep(0.0, 0.08, sum.a);
-    vec3 colour = sum.rgb / max(sum.a, 1e-4);
-    outColor = vec4(colour * coverage, coverage);
+    // Far field: a full background plane, filled from the probe where needed.
+    if (acc.a < 1e-4) {
+      col = fillCol.rgb / max(fillCol.a, 1e-4);
+      alpha = 1.0;
+    }
+    outColor = vec4(col, clamp(alpha, 0.0, 1.0));
   } else {
-    outColor = sum;
+    outColor = vec4(col, clamp(alpha, 0.0, 1.0));
   }
 }`;
 
@@ -501,19 +636,21 @@ void main() {
     S.progBlur = makeProgram(gl, LAYER_BLUR_FRAG, `layer blur`);
     S.progPre = makeProgram(gl, PRE_FRAG, `pre-pass`);
     S.locFinal = uniformLocations(gl, S.progFinal, [
-      `u_photo`, `u_depth`, `u_fpxNative`, `u_fmm`,
-      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxblur`, `u_highlight`,
-      `u_dnear`, `u_dfar`, `u_mode`, `u_linear`, `u_taps`, `u_res`,
+      `u_photo`, `u_depth`, `u_near`, `u_far`, `u_depthSize`,
+      `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`, `u_scale`, `u_blur`,
+      `u_maxRadius`, `u_grain`, `u_dnear`, `u_dfar`, `u_mode`, `u_linear`,
+      `u_res`, `u_zoom`, `u_center`,
     ]);
     S.locLayer = uniformLocations(gl, S.progLayer, [
-      `u_photo`, `u_depth`, `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`,
-      `u_scale`, `u_blur`, `u_highlight`, `u_maxblur`, `u_infoScale`,
-      `u_layer`, `u_info`, `u_linear`,
+      `u_photo`, `u_depth`, `u_depthSize`, `u_fpxNative`, `u_fmm`,
+      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxRadius`, `u_hlStops`,
+      `u_infoScale`, `u_layer`, `u_info`, `u_linear`, `u_zoom`, `u_center`,
     ]);
     S.locBlur = uniformLocations(gl, S.progBlur, [
-      `u_layerTex`, `u_infoTex`, `u_depth`, `u_res`, `u_fpxNative`, `u_fmm`,
-      `u_fstop`, `u_focus`, `u_scale`, `u_blur`, `u_maxblur`,
-      `u_maxLod`, `u_infoScale`, `u_layer`, `u_taps`,
+      `u_layerTex`, `u_infoTex`, `u_photo`, `u_depth`, `u_depthSize`,
+      `u_res`, `u_fpxNative`, `u_fmm`, `u_fstop`, `u_focus`, `u_scale`,
+      `u_blur`, `u_maxRadius`, `u_maxLod`, `u_infoScale`, `u_layer`,
+      `u_taps`, `u_zoom`, `u_center`,
     ]);
     S.locPre.u_src = gl.getUniformLocation(S.progPre, "u_src");
     S.fbo = gl.createFramebuffer();
@@ -687,6 +824,8 @@ void main() {
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
     const half = resizeDepthHalf(depthRaw, meta.width, meta.height, targetW, targetH);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, targetW, targetH, 0, gl.RED, gl.HALF_FLOAT, half);
+    S.depthW = targetW;
+    S.depthH = targetH;
     glError(gl, "depth upload");
 
     buildLinearTexture(targetW, targetH);
@@ -725,15 +864,13 @@ void main() {
     }
   }
 
-  function ensureTargets(outputW, outputH, forExport = false) {
-    // Preview stays light; an export may use the full output resolution so
-    // barely-OOF areas do not drop to a 6 MP blur buffer and show a step.
-    const maxPixels = forExport ? MAX_WORK_PIXELS * 4 : MAX_WORK_PIXELS;
-    const areaScale = Math.sqrt(maxPixels / (outputW * outputH));
-    const sideScale = MAX_WORK_SIDE / Math.max(outputW, outputH);
-    const scale = Math.min(1, areaScale, sideScale);
-    const w = Math.max(1, Math.round(outputW * scale));
-    const h = Math.max(1, Math.round(outputH * scale));
+  function ensureTargets(outputW, outputH) {
+    // The layer textures match the render target exactly: the final composite
+    // reads them at canvas UV, and the near/far fields are built at the same
+    // resolution the canvas is drawn at. A preview is small; an export is the
+    // photo size (capped by maxExport).
+    const w = Math.max(1, Math.round(outputW));
+    const h = Math.max(1, Math.round(outputH));
     if (S.targets && S.targets.w === w && S.targets.h === h) return S.targets;
 
     releaseTargets();
@@ -768,10 +905,13 @@ void main() {
     gl.uniform1f(loc.u_fmm, fmm);            // simulated (or native) focal, mm
     gl.uniform1f(loc.u_fstop, FSTOPS[S.fstopIdx]);
     gl.uniform1f(loc.u_focus, S.focus);
-    gl.uniform1f(loc.u_scale, w / m.width);
+    gl.uniform1f(loc.u_scale, w / m.width * S.zoom);
     gl.uniform1f(loc.u_blur, S.blur);
-    gl.uniform1f(loc.u_maxblur, Math.min(w, h) * 0.10);
+    gl.uniform1f(loc.u_maxRadius, Math.min(w, h) * 0.10 * S.zoom);
     gl.uniform1i(loc.u_linear, linear ? 1 : 0);
+    gl.uniform2f(loc.u_depthSize, S.depthW || m.width, S.depthH || m.height);
+    gl.uniform1f(loc.u_zoom, S.zoom);
+    gl.uniform2f(loc.u_center, S.cx, S.cy);
   }
 
   function prepareLayers(linear) {
@@ -786,7 +926,9 @@ void main() {
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
     gl.uniform1i(S.locLayer.u_depth, 1);
     setLayerUniforms(S.locLayer, t.w, t.h, linear);
-    gl.uniform1f(S.locLayer.u_highlight, S.highlight);
+    // The clip mask only exists on the linear texture; the raw fallback has no
+    // highlight headroom to recover.
+    gl.uniform1f(S.locLayer.u_hlStops, linear ? S.highlight * 5.0 : 0.0);
     gl.uniform1f(S.locLayer.u_infoScale, t.infoScale);
 
     for (let layer = 0; layer < 2; layer++) {
@@ -823,8 +965,11 @@ void main() {
     setLayerUniforms(S.locBlur, t.w, t.h, linear);
 
     gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, linear ? S.tex.linear : S.tex.photo);
+    gl.uniform1i(S.locBlur.u_photo, 2);
+    gl.activeTexture(gl.TEXTURE3);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
-    gl.uniform1i(S.locBlur.u_depth, 2);
+    gl.uniform1i(S.locBlur.u_depth, 3);
     gl.viewport(0, 0, t.w, t.h);
 
     for (let layer = 0; layer < 2; layer++) {
@@ -855,22 +1000,30 @@ void main() {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, S.tex.depth);
     gl.uniform1i(S.locFinal.u_depth, 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, S.targets ? S.targets.nearBlur : null);
+    gl.uniform1i(S.locFinal.u_near, 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, S.targets ? S.targets.farBlur : null);
+    gl.uniform1i(S.locFinal.u_far, 3);
 
     const fmm = effFocal();
     gl.uniform1f(S.locFinal.u_fpxNative, m.f_px);
     gl.uniform1f(S.locFinal.u_fmm, fmm);
     gl.uniform1f(S.locFinal.u_fstop, FSTOPS[S.fstopIdx]);
     gl.uniform1f(S.locFinal.u_focus, S.focus);
-    gl.uniform1f(S.locFinal.u_scale, canvas.width / m.width);
+    gl.uniform1f(S.locFinal.u_scale, canvas.width / m.width * S.zoom);
     gl.uniform1f(S.locFinal.u_blur, S.blur);
-    gl.uniform1f(S.locFinal.u_maxblur, Math.min(canvas.width, canvas.height) * 0.10);
-    gl.uniform1f(S.locFinal.u_highlight, S.highlight);
+    gl.uniform1f(S.locFinal.u_maxRadius, Math.min(canvas.width, canvas.height) * 0.10 * S.zoom);
+    gl.uniform1f(S.locFinal.u_grain, S.grain * 0.02);
     gl.uniform1f(S.locFinal.u_dnear, S.dLo);
     gl.uniform1f(S.locFinal.u_dfar, S.dHi);
     gl.uniform1i(S.locFinal.u_mode, mode);
     gl.uniform1i(S.locFinal.u_linear, useLinear ? 1 : 0);
-    gl.uniform1i(S.locFinal.u_taps, Math.max(8, Math.min(192, taps || PREVIEW_TAPS)));
     gl.uniform2f(S.locFinal.u_res, canvas.width, canvas.height);
+    gl.uniform2f(S.locFinal.u_depthSize, S.depthW || m.width, S.depthH || m.height);
+    gl.uniform1f(S.locFinal.u_zoom, S.zoom);
+    gl.uniform2f(S.locFinal.u_center, S.cx, S.cy);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     if (S.busy) glError(gl, "final render", false);
   }
@@ -882,6 +1035,11 @@ void main() {
 
     const effMode = S.holdOriginal ? 2 : S.mode;
     const useLinear = S.linearOK && effMode !== 2;
+    if (effMode === 0) {
+      ensureTargets(canvas.width, canvas.height);
+      prepareLayers(useLinear);
+      blurLayers(taps, useLinear);
+    }
     renderFinal(effMode, useLinear, taps);
   }
 
@@ -980,7 +1138,25 @@ void main() {
       b.classList.toggle("active", Math.abs(parseFloat(b.dataset.stop) - FSTOPS[S.fstopIdx]) < 0.01);
     });
     $("blurOut").textContent = `${S.blur.toFixed(2)}×`;
-    $("highlightOut").textContent = S.highlight.toFixed(2);
+    $("highlightOut").textContent = `${(S.highlight * 5).toFixed(1)} stops`;
+    if ($("grainOut")) $("grainOut").textContent = S.grain.toFixed(2);
+  }
+
+  /* ------------------------------------------------------------------- zoom/pan */
+
+  function clampView() {
+    S.zoom = clamp(S.zoom, 1, 12);
+    const half = 0.5 / S.zoom;
+    S.cx = clamp(S.cx, half, 1 - half);
+    S.cy = clamp(S.cy, half, 1 - half);
+  }
+
+  function updateZoomUI() {
+    const view = $("view");
+    view.style.cursor = S.zoom > 1 ? "grab" : "crosshair";
+    $("hudHint").innerHTML = S.zoom > 1
+      ? `Zoom ${Math.round(S.zoom * 100)}% · drag to pan · double-click to fit`
+      : `Click photo to focus · wheel to zoom · <kbd>Space</kbd> original`;
   }
 
   function setMode(mode) {
@@ -1025,6 +1201,9 @@ void main() {
       const meta = await res.json();
       if (!res.ok || meta.error) throw new Error(meta.error || `HTTP ${res.status}`);
       S.meta = meta;
+      S.zoom = 1;
+      S.cx = 0.5;
+      S.cy = 0.5;
 
       $("overlayTitle").textContent = "Loading depth";
       $("overlaySub").textContent = `${meta.width} × ${meta.height} px`;
@@ -1063,6 +1242,7 @@ void main() {
 
       updateFocusUI();
       updateLensUI();
+      updateZoomUI();
       layout();
       overlay(false);
     } catch (err) {
@@ -1156,22 +1336,28 @@ void main() {
     const w = Math.round(meta.width * k);
     const h = Math.round(meta.height * k);
 
-    overlay(true, "Rendering", `${w} × ${h} px · layered mip bokeh · ${taps} aperture taps`, 35);
+    overlay(true, "Rendering", `${w} × ${h} px · two-field bokeh · ${taps} aperture taps`, 35);
     await sleep(60);
 
     const prevW = canvas.width, prevH = canvas.height;
     const prevMode = S.mode;
+    const prevZoom = S.zoom, prevCx = S.cx, prevCy = S.cy;
     canvas.width = w;
     canvas.height = h;
     S.mode = mode;
+    S.zoom = 1; S.cx = 0.5; S.cy = 0.5;   // export is always the whole frame
     render(taps, true);
 
     const blob = await new Promise((res) => canvas.toBlob(res, mime, S.quality / 100));
 
     S.mode = prevMode;
+    S.zoom = prevZoom;
+    S.cx = prevCx;
+    S.cy = prevCy;
     canvas.width = prevW;
     canvas.height = prevH;
     layout();
+    updateZoomUI();
     overlay(false);
 
     if (!blob) throw new Error("The browser could not encode the image.");
@@ -1290,6 +1476,12 @@ void main() {
       requestRender();
     });
 
+    $("grain").addEventListener("input", (e) => {
+      S.grain = +e.target.value / 100;
+      updateLensUI();
+      requestRender();
+    });
+
     $("autoFocus").onclick = () => {
       if (!S.meta) return;
       S.focus = clamp(autoFocusValue(), S.dLo, S.dHi);
@@ -1327,10 +1519,12 @@ void main() {
     $("saveDepth").onclick = exportDepth;
 
     $("view").addEventListener("click", (e) => {
+      if (S.suppressClick) { S.suppressClick = false; return; } // that was a pan
+      if (e.detail > 1) return; // second click of a double-click: don't refocus
       if (!S.meta || S.mode === 2) return; // focus picking works in Result and Depth Map
       const rect = $("view").getBoundingClientRect();
-      const u = (e.clientX - rect.left) / rect.width;
-      const v = (e.clientY - rect.top) / rect.height;
+      const u = S.cx + ((e.clientX - rect.left) / rect.width - 0.5) / S.zoom;
+      const v = S.cy + ((e.clientY - rect.top) / rect.height - 0.5) / S.zoom;
       const z = depthAt(u, v);
       if (!z || !isFinite(z)) return;
       S.focus = clamp(z, S.dLo, S.dHi);
@@ -1347,6 +1541,59 @@ void main() {
       ring.hidden = false;
       clearTimeout(ring._t);
       ring._t = setTimeout(() => { ring.hidden = true; }, 600);
+    });
+
+    const viewEl = $("view");
+    viewEl.addEventListener("wheel", (e) => {
+      if (!S.meta) return;
+      e.preventDefault();
+      const rect = viewEl.getBoundingClientRect();
+      const sx = (e.clientX - rect.left) / rect.width;
+      const sy = (e.clientY - rect.top) / rect.height;
+      // keep the photo point under the cursor fixed while zooming
+      const px = S.cx + (sx - 0.5) / S.zoom;
+      const py = S.cy + (sy - 0.5) / S.zoom;
+      S.zoom = clamp(S.zoom * Math.exp(-e.deltaY * 0.0015), 1, 12);
+      S.cx = px - (sx - 0.5) / S.zoom;
+      S.cy = py - (sy - 0.5) / S.zoom;
+      clampView();
+      updateZoomUI();
+      requestRender();
+    }, { passive: false });
+
+    viewEl.addEventListener("mousedown", (e) => {
+      if (!S.meta || e.button !== 0) return;
+      S.suppressClick = false;
+      S.drag = { x: e.clientX, y: e.clientY, cx: S.cx, cy: S.cy, moved: false,
+                 rect: viewEl.getBoundingClientRect() };
+      if (S.zoom > 1) viewEl.style.cursor = "grabbing";
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      if (!S.drag) return;
+      const d = S.drag;
+      if (!d.moved && Math.abs(e.clientX - d.x) + Math.abs(e.clientY - d.y) < 3) return;
+      d.moved = true;
+      S.cx = d.cx - (e.clientX - d.x) / d.rect.width / S.zoom;
+      S.cy = d.cy - (e.clientY - d.y) / d.rect.height / S.zoom;
+      clampView();
+      requestRender();
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (!S.drag) return;
+      S.suppressClick = S.drag.moved; // a pan must not also set focus
+      S.drag = null;
+      updateZoomUI();
+    });
+
+    viewEl.addEventListener("dblclick", () => {
+      if (!S.meta) return;
+      S.zoom = 1;
+      S.cx = 0.5;
+      S.cy = 0.5;
+      updateZoomUI();
+      requestRender();
     });
 
     window.addEventListener("keydown", (e) => {
@@ -1448,6 +1695,7 @@ void main() {
   $("fstop").value = S.fstopIdx;
   S.fstopIdx = +$("fstop").value;
   updateLensUI();
+  updateZoomUI();
   statusProbe();
 
   // Headless-renderer test hook. Only with ?debug: a probe can set the state

@@ -46,18 +46,21 @@ launches take ~12 s to build the model on the CPU and hand it to the GPU.
 
 | | |
 |---|---|
-| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. ~1.5–2.5 s for a photo, ~4 s for a 27 MP one. |
+| **Depth** | `apple/DepthPro2-H` (872 M params, bf16) at 1280 px on the GPU, refined to full resolution with a colour-aware guided filter so silhouettes stay aligned with the photo, including chroma edges of equal luminance. ~1.5–2.5 s for a photo, ~4 s for a 27 MP one. The DOF gathers fetch depth with nearest sampling and a 3×3 nearest-colour snap, so the filter's 2 px mixed-depth ramp cannot paint a sharp outline when it crosses the focus plane. |
 | **Focus** | Slider, *Auto* (median of the centre), *Centre*, or click anywhere in the photo. Distances are in metres, straight from the model. |
 | **Aperture** | f/1.0 → f/22 in third stops. |
 | **Lens** | *Native* uses the focal length the model estimates; 50/85/135 mm simulate a longer lens, which is how you get a portrait look out of a wide-angle frame. |
-| **Render** | WebGL2 single-pass scatter-as-gather bokeh in **linear light**. Each tap is weighted by the sample's own circle of confusion, so a sharp neighbour only reaches a pixel when its blur disc is wide enough — no foreground bleed and no halo at the subject edge. 96 taps preview, 192 on export, crisp polygon aperture, then the result is encoded to sRGB. |
+| **Zoom** | Wheel zoom about the cursor up to 12×, drag to pan, double-click to fit. The DOF is recomputed at the zoomed scale and the blur cap scales with the zoom, so the inspected blur matches the export. Export always renders the whole frame. |
+| **Render** | Two-field WebGL2 bokeh in **linear light**: a far/focus field with a per-tap CoC reach test and a mip-filled background, then a near field with a coverage alpha, so a defocused foreground spreads over a sharp background instead of being cut out. The aperture is a nine-blade polygon whose roundness follows the f-stop, with mechanical cat's-eye clipping toward the frame edge and a spherical-aberration rim. A tap beyond the pixel's own blur radius must be nearer than the destination, so a blurrier background cannot paint over the midground. 96 taps preview, 192 export, prefiltered to the tap spacing. |
+| **Highlights** | A 0–5 stop slider expands only clipped, isolated speculars in the blur source, so bokeh balls carry energy instead of averaging down to grey. Large clipped areas (sky, windows) are left alone, and the sharp base stays unexpanded. |
+| **Grain** | Matching grain in blurred areas, weighted by the local defocus and the shadow level, so a wide-aperture render does not look unnaturally clean at 1:1. |
 | **Export** | Full-resolution JPEG/PNG rendered in the browser, plus the depth map as a PNG. |
 
 The depth-of-field band under the focus slider is the honest lens model
 (35 mm-equivalent focal length, 30 µm CoC, hyperfocal distance), so it tells you
-what a real lens of that focal length and aperture would do. The blur slider is
-explicitly artistic: it scales the circle of confusion without pretending the
-optics changed.
+what a real lens of that focal length and aperture would do. The blur,
+highlight and grain sliders are explicitly artistic: they change the render,
+not the optics.
 
 ## Hardware
 
@@ -67,17 +70,25 @@ under bf16 autocast anyway) and keeps the depth head and focal estimator in
 float32. Inference peaks at 3.96 GB at 1280 px, 4.9 GB at 1536 px
 (`set DEPTH_SIDE=1536` to try it). If the card is full it retries at 1024 → 768.
 
+The two-field renderer keeps four canvas-sized layer textures plus their mips
+and two blur targets. At 24 MP that is roughly 1.5 GB of export buffers; the
+model and the exporter do not peak at the same time, so 24 MP is comfortable
+on the 6 GB target. An 8192 px export can exceed it.
+
 ## Layout
 
 ```
 app.py              FastAPI server: /api/analyze, depth IO, static hosting
 static/index.html   UI shell
 static/style.css    dark photo-editor styling
-static/app.js       WebGL2 DOF shader, controls, export
+static/app.js       two-field WebGL2 DOF pipeline, controls, zoom/pan, export
 probe_sizes.py      measures VRAM and latency per inference size
 test_backend.py     headless pipeline check (no browser)
+tests/mock_depth_server.py  synthetic scene + depth, no torch/GPU needed
+tests/render_probe.py       headless Chromium probe: focus/aperture/zoom/export
 cdp_test.py         drives headless Brave over CDP: orientation, depth ordering,
-                    aperture/refocus behaviour, export path  -> browser_test.js
+                    aperture/refocus behaviour, zoom/pan, export path
+                    -> browser_test.js
 cdp_screen.py       screenshots the empty and loaded UI
 data/<id>/          cached photo.png + depth.f16 + meta.json (last 8 photos)
 ```
@@ -87,7 +98,17 @@ data/<id>/          cached photo.png + depth.f16 + meta.json (last 8 photos)
 * Depth is metric *for the camera that took the photo* — the model predicts depth
   in metres from a monocular cue, and the absolute scale is approximate on
   unusual scenes (very wide lenses, heavy crops, macro). Relative depth is solid.
-* Sky is infinite depth: it gets the maximum blur, which is what you want.
+* Sky is infinite depth (1/z = 0); it gets the blur for the chosen focus, which
+  is the largest blur for distant content but not always the largest in frame —
+  a close foreground can be defocused more.
+* The source photo's own depth of field is not deconvolved. The renderer adds
+  the target CoC; a photo already stopped down cannot recover detail the original
+  lens removed. On DSLR sources the right target is closer to
+  √(c² − c_native²) when EXIF gives the source aperture, but that is a
+  heuristic, not a deconvolution.
+* The blur radius is capped at 10% of the short side of the frame. On a 24 MP
+  export that is 400 px, above the physical CoC for the built-in lens presets at
+  their widest and longest settings.
 
 ## Licence
 

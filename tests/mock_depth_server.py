@@ -40,7 +40,9 @@ def build_scene() -> tuple[np.ndarray, np.ndarray]:
     img = np.stack([base * 0.82, base * 0.92, base * 1.10], axis=-1)
     img[mid] = np.array([0.22, 0.48, 0.30])
     tex = 0.14 * np.sin(xx / 7.0) + 0.14 * np.cos(yy / 9.0)
-    img[near] = np.stack([0.82 + tex, 0.24 + 0.5 * tex, 0.16 + 0.25 * tex], axis=-1)[near]
+    # Keep the near red below the clipping threshold; only the specular dot
+    # should be clipped, so the highlight-expansion test measures the dot.
+    img[near] = np.stack([0.68 + 0.12 * tex, 0.22 + 0.40 * tex, 0.15 + 0.20 * tex], axis=-1)[near]
     spec = (xx - 300) ** 2 + (yy - 320) ** 2 < 5 ** 2
     img[spec] = [1.0, 1.0, 1.0]
     img += rng.normal(0.0, 0.018, img.shape)

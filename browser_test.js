@@ -269,6 +269,79 @@
   }
   setLens(0);
 
+  // ------------------------------------------------------- 4. zoom, pan, reset
+  // Wheel zooms about the cursor (the point under the cursor must not move),
+  // dragging pans, double-click returns to fit, and export ignores the zoom.
+  const rect2 = src.getBoundingClientRect();
+  const cx0 = rect2.left + rect2.width * 0.5;
+  const cy0 = rect2.top + rect2.height * 0.5;
+  const pixAt = (img, fx, fy) => {
+    const x = Math.min(W - 1, Math.max(0, Math.round(fx * (W - 1))));
+    const y = Math.min(H - 1, Math.max(0, Math.round(fy * (H - 1))));
+    const i = (y * W + x) * 4;
+    return [img.data[i], img.data[i + 1], img.data[i + 2]];
+  };
+  const meanDiff = (p, q) => {
+    let s = 0;
+    for (let i = 0; i < p.data.length; i += 4) {
+      s += Math.abs(p.data[i] - q.data[i]) + Math.abs(p.data[i + 1] - q.data[i + 1]) + Math.abs(p.data[i + 2] - q.data[i + 2]);
+    }
+    return s / (p.data.length / 4) / 3;
+  };
+  const wheel = (dy, x = cx0, y = cy0) =>
+    src.dispatchEvent(new WheelEvent("wheel", { bubbles: true, cancelable: true, clientX: x, clientY: y, deltaY: dy }));
+  const drag = (fromX, fromY, toX, toY) => {
+    src.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, clientX: fromX, clientY: fromY, button: 0 }));
+    window.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: toX, clientY: toY }));
+    window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: toX, clientY: toY, button: 0 }));
+  };
+
+  setMode(2);                       // original view: deterministic pixels
+  await frame();
+  const fit = cap();
+  const before = pixAt(fit, 0.5, 0.5);
+
+  wheel(-600);                      // zoom in about the centre
+  await frame(); await sleep(150);
+  const zoomed = cap();
+  out.zoom = { changed: +meanDiff(fit, zoomed).toFixed(2) };
+  const after = pixAt(zoomed, 0.5, 0.5);
+  out.zoom.centerDrift = Math.abs(after[0] - before[0]) + Math.abs(after[1] - before[1]) + Math.abs(after[2] - before[2]);
+  if (out.zoom.changed < 8) fail.push("wheel did not zoom the view");
+  if (out.zoom.centerDrift > 40) fail.push("zoom moved the point under the cursor (drift " + out.zoom.centerDrift + ")");
+
+  drag(cx0, cy0, cx0 + 160, cy0);   // pan right
+  await frame(); await sleep(120);
+  const panned = cap();
+  out.zoom.panDiff = +meanDiff(zoomed, panned).toFixed(2);
+  if (out.zoom.panDiff < 5) fail.push("drag did not pan the view");
+  drag(cx0 + 160, cy0, cx0, cy0);   // pan back
+  await frame(); await sleep(120);
+  out.zoom.panBackDiff = +meanDiff(zoomed, cap()).toFixed(2);
+  if (out.zoom.panBackDiff > 3) fail.push("panning back did not restore the view");
+
+  src.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, clientX: cx0, clientY: cy0 }));
+  await frame(); await sleep(150);
+  out.zoom.resetDiff = +meanDiff(fit, cap()).toFixed(2);
+  if (out.zoom.resetDiff > 2) fail.push("double-click did not reset the zoom");
+
+  // panning must not steal click-to-focus; a plain click must still focus
+  setMode(0);
+  await frame();
+  const focus0 = $("focusOut").textContent;
+  drag(cx0, cy0, cx0 + 120, cy0);
+  await frame();
+  // a real drag is followed by a click on release: consume it
+  src.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: cx0 + 120, clientY: cy0 }));
+  await frame();
+  out.zoom.panFocus = $("focusOut").textContent;
+  if (out.zoom.panFocus !== focus0) fail.push("panning changed the focus point");
+  src.dispatchEvent(new MouseEvent("click", { bubbles: true, clientX: rect2.left + rect2.width * 0.3, clientY: rect2.top + rect2.height * 0.7 }));
+  await frame();
+  out.zoom.clickFocus = $("focusOut").textContent;
+  if (out.zoom.clickFocus === focus0) fail.push("click-to-focus stopped working after zoom support");
+  setMode(0);
+
   // -------------------------------------------------------------- 4. export path
   const exports = [];
   const origCreate = URL.createObjectURL;
