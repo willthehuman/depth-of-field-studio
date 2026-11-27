@@ -1449,4 +1449,10 @@ void main() {
   S.fstopIdx = +$("fstop").value;
   updateLensUI();
   statusProbe();
+
+  // Headless-renderer test hook. Only with ?debug: a probe can set the state
+  // and paint a frame without going through the sliders.
+  if (new URLSearchParams(location.search).has("debug")) {
+    window.__dof = { S, render, requestRender, layout, updateFocusUI, updateLensUI };
+  }
 })();
