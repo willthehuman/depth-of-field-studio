@@ -74,14 +74,15 @@ def wait_http(url: str, timeout_s: float = 60.0) -> None:
     raise RuntimeError(f"{url} did not come up")
 
 
-def launch_browser(url: str, chrome: str, profile: Path) -> subprocess.Popen:
+def launch_browser(url: str, chrome: str, profile: Path, gpu: bool = False) -> subprocess.Popen:
     profile.mkdir(parents=True, exist_ok=True)
+    flags = ["--use-gl=angle", "--use-angle=gl", "--ignore-gpu-blocklist", "--enable-gpu"] if gpu \
+        else ["--enable-unsafe-swiftshader", "--use-gl=angle", "--use-angle=swiftshader"]
     proc = subprocess.Popen([
         chrome, "--headless=new", f"--remote-debugging-port={PORT}",
         f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
         "--no-sandbox", "--disable-dev-shm-usage", "--hide-scrollbars",
-        "--window-size=1400,900", "--enable-unsafe-swiftshader",
-        "--use-gl=angle", "--use-angle=swiftshader", url,
+        "--window-size=1400,900", *flags, url,
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_http(f"http://127.0.0.1:{PORT}/json/version")
     return proc
@@ -116,16 +117,19 @@ def main() -> None:
                     help="Chromium/Chrome binary (or $CHROMIUM)")
     ap.add_argument("--profile", default=str(Path.home() / ".cache" / "dof-probe-profile"),
                     help="headless browser profile directory")
+    ap.add_argument("--gpu", action="store_true", help="use the hardware GL backend instead of SwiftShader")
+    ap.add_argument("--real-image", default=None,
+                    help="URL path (e.g. /big.jpg) to load through the real /api/analyze server")
     args = ap.parse_args()
 
     url = f"http://127.0.0.1:{args.port}/?debug=1"
-    server = subprocess.Popen([sys.executable, str(ROOT / "tests" / "mock_depth_server.py"),
-                               "--port", str(args.port)], cwd=ROOT,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    server = None if args.real_image else subprocess.Popen(
+        [sys.executable, str(ROOT / "tests" / "mock_depth_server.py"), "--port", str(args.port)],
+        cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     browser = None
     try:
         wait_http(f"http://127.0.0.1:{args.port}/api/status")
-        browser = launch_browser(url, args.chromium, Path(args.profile))
+        browser = launch_browser(url, args.chromium, Path(args.profile), args.gpu)
         targets = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/list").read())
         page = next((t for t in targets if t["type"] == "page" and "127.0.0.1" in t.get("url", "")), None)
         if page is None:
@@ -139,13 +143,28 @@ def main() -> None:
         if not cdp.wait_for("document.readyState === 'complete' && !!document.getElementById('sampleBtn')", 60):
             raise RuntimeError("page did not load")
 
-        # Load the synthetic sample through the real UI path.
-        cdp.eval("document.getElementById('sampleBtn').click()")
-        if not cdp.wait_for("window.__dof && !document.getElementById('exportBtn').disabled", 180):
-            errs = [e for e in cdp.events if e.get("method") in
-                    ("Runtime.exceptionThrown", "Log.entryAdded")]
-            raise RuntimeError("sample never rendered; events: " + json.dumps(errs)[:4000])
-        cdp.eval("document.getElementById('sampleBtn').blur()")
+        if args.real_image:
+            loaded = cdp.eval(f"""(() => {{
+              const d = window.__dof;
+              return (async () => {{
+                const b = await fetch({args.real_image!r}).then(r => r.blob());
+                const f = new File([b], 'big.jpg', {{type: b.type || 'image/jpeg'}});
+                await d.openFile(f);
+                return {{w: d.S.meta.width, h: d.S.meta.height, focus: d.S.focus,
+                         total: d.S.meta.total_seconds, inference: d.S.meta.inference}};
+              }})();
+            }})()""", await_promise=True, timeout_s=900)
+            print(json.dumps({"real_image": loaded}))
+            if not cdp.wait_for("window.__dof && window.__dof.S.meta && !document.getElementById('exportBtn').disabled", 600):
+                raise RuntimeError("real image never rendered")
+        else:
+            # Load the synthetic sample through the real UI path.
+            cdp.eval("document.getElementById('sampleBtn').click()")
+            if not cdp.wait_for("window.__dof && !document.getElementById('exportBtn').disabled", 180):
+                errs = [e for e in cdp.events if e.get("method") in
+                        ("Runtime.exceptionThrown", "Log.entryAdded")]
+                raise RuntimeError("sample never rendered; events: " + json.dumps(errs)[:4000])
+            cdp.eval("document.getElementById('sampleBtn').blur()")
 
         if args.export_ui:
             dl = Path(args.download_dir)
@@ -295,11 +314,12 @@ def main() -> None:
                 browser.wait(timeout=10)
             except Exception:
                 browser.kill()
-        server.terminate()
-        try:
-            server.wait(timeout=10)
-        except Exception:
-            server.kill()
+        if server is not None:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except Exception:
+                server.kill()
 
 
 if __name__ == "__main__":

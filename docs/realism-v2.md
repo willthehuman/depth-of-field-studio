@@ -45,11 +45,12 @@ everything else is client-side.
   resolution** into an R16F texture; the layer, blur and final `texelFetch` it
   instead of repeating the search seven times per frame. The snap takes the
   min/max depth and chooses the extreme whose cluster-mean colour is closest,
-  but only when the centre sits inside the mixed band and the window has at
-  least three samples in **each** 10 % extreme cluster. A real step has plateaus
-  on both sides; a smooth slope only touches each extreme at one or two samples,
-  so it is left smooth instead of being terraced. The snap is built once per
-  photo, not per focus tick. It is stored in **photo orientation** (the FBO row
+  but only when the centre sits inside the mixed band, the window has at least
+  three samples in **each** 10 % extreme cluster, and the two cluster means
+  differ in colour (`|mn − mf|² > 0.01`). A real step has plateaus on both sides;
+  a smooth slope only touches each extreme at one or two samples, and a planar
+  colour ramp has no colour edge. The snap is built once per photo, not per
+  focus tick. It is stored in **photo orientation** (the FBO row
   is flipped once in `SNAP_FRAG`); every reader indexes
   `texelFetch(u_depthSnap, p, 0)` top-down, so a bottom-of-frame near object is
   not classified with the top plane's depth. A 0.4-scale preview (384×256)
@@ -58,19 +59,24 @@ everything else is client-side.
 * **Prefiltered taps.** The gather reads the layer mips at
   `log2(radius * sqrt(pi / taps))`, so 96/192 taps cover a 40–280 px disc
   without the mip-0 stipple.
-* **Radius-stratified taps.** When the destination's own CoC is below a quarter
-  of the dilated gather radius, 24 taps form an inner disc at `1.07·own` with
-  their own area weight and their own (sharper) mip; the rest cover the outer
-  annulus. Without it a small-CoC source beside a large near blur got only 1–5
-  taps and its alpha speckled.
+* **Radius-stratified taps.** When the destination's effective CoC
+  `ownE = max(own, 0.5)` is below a quarter of the dilated gather radius, 24
+  taps form an inner disc at `1.07·ownE` with their own area weight and their
+  own (sharper) mip; the rest cover the outer annulus. Without it a small-CoC
+  source beside a large near blur got only 1–5 taps and its alpha speckled;
+  the `0.5` floor also catches destinations just in front of focus.
 * **Preview LOD.** The base photo reads `log2(1/u_scale)` instead of mip 0, so
   a 24 MP frame on a 1200 px canvas no longer aliases in the original view.
-* **Aperture.** A nine-blade polygon whose roundness follows the f-stop, with
-  equal-radius cat's-eye clipping toward the frame edge and an energy-neutral
-  spherical-aberration rim. The gather covers the polygon's circumradius
-  (1.07×, also centring the source-disc ramp), so the 9-gon is actually visible
-  at f/4+; the old circular source test clipped the vertices. The alpha is
-  divided by the exact two-circle intersection area, not a linear fit.
+* **Aperture.** A nine-blade polygon whose roundness follows the f-stop, with a
+  **hard** cat's-eye clip by a circle of radius `1.07 − 0.07·cat` offset
+  `0.60·cat` toward the frame edge: at `cat = 0` it sits outside the 1.042
+  polygon, at `cat = 1` it is the equal-radius almond. The old
+  `mix(1, clip2, cat)` left a translucent `1−cat` crescent instead of a
+  geometric clip. An energy-neutral spherical-aberration rim is added after.
+  The gather covers the polygon's circumradius (1.07×, also centring the
+  source-disc ramp), so the 9-gon is visible at f/4+. The alpha is divided by
+  the exact two-circle intersection area `catArea2(1, rc, 0.60·cat)/π`, not a
+  linear fit.
 * **Highlights.** A 0–5 stop expansion in a **full-resolution radiance texture**
   at mip 0, before the layer mips average the colour. The isolation gate is the
   mip-5 clip fraction; the layer mixes the radiance in by the pixel's own blur
@@ -147,10 +153,24 @@ unless stated:
   1.41 / 255 mean absolute, max 35; the earlier 2.37 was not a like-for-like
   crop and is superseded.
 
-SwiftShader timings are not representative of a discrete GPU. The target is a
-6 GB card; the real Depth Pro model was never run on one, so the 24 MP memory
-figure is an accounting estimate, not a measurement. The probe takes ~16 s per
-preview frame under software rasterisation.
+## Real-photo validation
+
+On an RTX 4070 SUPER (12 GB), with the real Depth Pro 2 H+ weights and the real
+client (not the mock):
+
+- Model load 9.2 s warm; 1920×1440 analysis 0.70 s; 5656×4242 analysis 3.11 s
+  (inference 0.76 s, refine 0.14 s); peak inference VRAM 3.96 GB.
+- 5656×4242 export: 21.9 MB PNG, 3.0 s including the real analysis; tiled vs
+  non-tiled **0.000 / 0.0**; whole-render GPU use ~2.8 GB.
+- `cdp_test.py` browser suite against the real app: **ok: true**, no failures;
+  export 1920×1440; click-to-focus while zoomed works; zoom anchor drift
+  3.7/255 on a 5×5 patch.
+- 0.4× preview vs the 24 MP export downsampled: mean 0.460/255, p99 4.0,
+  max 31; top-decile gradient band mean 1.26/255.
+
+The 6 GB card was the original target; the model and 24 MP render now fit on
+the 12 GB card with measured headroom, but the 6 GB re-run is still open.
+SwiftShader timings are not representative of this GPU.
 
 ## Deliberately not done
 

@@ -64,21 +64,24 @@ not the optics.
 
 ## Hardware
 
-Tuned for a 6 GB card. The released checkpoint is a 3.3 GB float32 download; the
-app builds the model on the CPU, casts the encoder and decoder to bf16 (they
-only ever run under bf16 autocast anyway) and keeps the depth head and focal
-estimator in float32. The resident encoder/decoder is about 1.8 GB. Inference
-peaks at 3.96 GB at 1280 px, 4.9 GB at 1536 px (`set DEPTH_SIDE=1536` to try
-it). If the card is full it retries at 1024 → 768.
+Started on a 6 GB card and verified on an RTX 4070 SUPER (12 GB). The released
+checkpoint is a 3.3 GB float32 download; the app builds the model on the CPU,
+casts the encoder and decoder to bf16 (they only ever run under bf16 autocast
+anyway) and keeps the depth head and focal estimator in float32. The resident
+encoder/decoder is about 1.8 GB. Inference peaks at 3.96 GB at 1280 px on the
+12 GB card; 4.9 GB at 1536 px (`set DEPTH_SIDE=1536` to try it). A 5656×4242
+photo analysed in 3.1 s and exported in 3.0 s, with the whole 24 MP render
+peaking around 2.8 GB of GPU memory; tiled and non-tiled exports are
+pixel-identical. The 6 GB target was not re-run, but the measured headroom is
+now known rather than guessed.
 
 The two-field renderer keeps four canvas-sized float layer textures plus their
 mips, two blur targets, the full-resolution linear photo and the full-resolution
-radiance texture. At 24 MP that is roughly 2 GB of export buffers. `app.py`
-releases the transient H+ activations with `torch.cuda.empty_cache()` after the
-estimate, but the bf16 encoder/decoder (about 1.8 GB) and the float32 head stay
-resident, so 24 MP is tight on the 6 GB target; 8 GB is the comfortable figure.
-An 8192 px export can exceed it. The export is drawn in ≤ 2 MP bands with a
-flush between draws to stay under the Windows TDR limit.
+radiance texture. At 24 MP the measured whole-render GPU use was about 2.8 GB
+(model plus buffers); it fits comfortably on the 12 GB card. The 6 GB target
+remains the tight estimate, not a measurement; an 8192 px export can exceed
+either. The export is drawn in ≤ 2 MP bands with a flush between draws to stay
+under the Windows TDR limit.
 
 ## Layout
 

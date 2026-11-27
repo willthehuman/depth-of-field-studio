@@ -9,6 +9,7 @@ Checks, in order:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -18,10 +19,10 @@ from pathlib import Path
 from websockets.sync.client import connect
 
 ROOT = Path(__file__).resolve().parent
-PORT = 9333
+PORT = 9346
 URL = "http://127.0.0.1:7860/"
-BROWSER = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-PROFILE = Path(r"C:\Users\wcperrier\AppData\Local\hermes\cache\scratch\brave-dof")
+BROWSER = os.environ.get("DOF_BROWSER") or "/usr/sbin/chromium"
+PROFILE = Path(os.environ.get("DOF_PROFILE", str(Path.home() / ".cache" / "dof-browser-test2")))
 
 
 def launch() -> subprocess.Popen:
@@ -37,10 +38,12 @@ def launch() -> subprocess.Popen:
             "--disable-extensions",
             "--window-size=1600,1000",
             "--hide-scrollbars",
+            "--no-sandbox", "--disable-dev-shm-usage",
+            "--enable-unsafe-swiftshader", "--use-gl=angle", "--use-angle=swiftshader",
             URL,
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=open("/tmp/cdp-browser.log", "wb"),
     )
     for _ in range(120):
         try:
@@ -53,7 +56,7 @@ def launch() -> subprocess.Popen:
 
 class CDP:
     def __init__(self, ws_url: str):
-        self.ws = connect(ws_url, max_size=64 * 1024 * 1024, legacy=True)
+        self.ws = connect(ws_url, max_size=64 * 1024 * 1024)
         self.n = 0
 
     def send(self, method: str, **params):

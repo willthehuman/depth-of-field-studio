@@ -281,6 +281,21 @@
     const i = (y * W + x) * 4;
     return [img.data[i], img.data[i + 1], img.data[i + 2]];
   };
+  // Zoom changes baseLod, so a single pixel at the anchor can differ purely from
+  // the sharper mip. Average a small patch to test the anchor, not the LOD.
+  const patchAt = (img, fx, fy, r = 2) => {
+    const cx = Math.round(fx * (W - 1)), cy = Math.round(fy * (H - 1));
+    const sum = [0, 0, 0];
+    let n = 0;
+    for (let y = Math.max(0, cy - r); y <= Math.min(H - 1, cy + r); y++) {
+      for (let x = Math.max(0, cx - r); x <= Math.min(W - 1, cx + r); x++) {
+        const i = (y * W + x) * 4;
+        sum[0] += img.data[i]; sum[1] += img.data[i + 1]; sum[2] += img.data[i + 2];
+        n++;
+      }
+    }
+    return sum.map((v) => v / n);
+  };
   const meanDiff = (p, q) => {
     let s = 0;
     for (let i = 0; i < p.data.length; i += 4) {
@@ -299,13 +314,13 @@
   setMode(2);                       // original view: deterministic pixels
   await frame();
   const fit = cap();
-  const before = pixAt(fit, 0.5, 0.5);
+  const before = patchAt(fit, 0.5, 0.5);
 
   wheel(-600);                      // zoom in about the centre
   await frame(); await sleep(150);
   const zoomed = cap();
   out.zoom = { changed: +meanDiff(fit, zoomed).toFixed(2) };
-  const after = pixAt(zoomed, 0.5, 0.5);
+  const after = patchAt(zoomed, 0.5, 0.5);
   out.zoom.centerDrift = Math.abs(after[0] - before[0]) + Math.abs(after[1] - before[1]) + Math.abs(after[2] - before[2]);
   if (out.zoom.changed < 8) fail.push("wheel did not zoom the view");
   if (out.zoom.centerDrift > 40) fail.push("zoom moved the point under the cursor (drift " + out.zoom.centerDrift + ")");

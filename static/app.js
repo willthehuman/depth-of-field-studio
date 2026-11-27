@@ -202,11 +202,15 @@ void main() {
     if (nNear >= 3.0 && nFar >= 3.0) {
       vec3 mn = cNear / nNear;
       vec3 mf = cFar / nFar;
-      float dn = dot(c0 - mn, c0 - mn);
-      float df = dot(c0 - mf, c0 - mf);
-      if (dn < df) outD = dmin;
-      else if (df < dn) outD = dmax;
-      else outD = dmax;              // exact tie: lean foreground
+      // A planar colour ramp also has many samples near both depth extremes;
+      // require a real colour edge between the two clusters before snapping.
+      if (dot(mn - mf, mn - mf) > 0.01) {
+        float dn = dot(c0 - mn, c0 - mn);
+        float df = dot(c0 - mf, c0 - mf);
+        if (dn < df) outD = dmin;
+        else if (df < dn) outD = dmax;
+        else outD = dmax;            // exact tie: lean foreground
+      }
     }
   }
   outColor = vec4(outD, 0.0, 0.0, 1.0);
@@ -609,12 +613,12 @@ float apertureShape(vec2 q, vec2 field, float fstop, float nearSign) {
   float fieldR = length(field);
   float cat = smoothstep(0.55, 1.65, fieldR) * (1.0 - smoothstep(2.8, 5.6, fstop));
   vec2 dir = field / max(fieldR, 1e-4);
-  float clip2 = smoothstep(1.025, 0.975, length(q - dir * (0.60 * cat)));
-  // The 0.60*cat offset carries the cat's-eye amount, so scale the clip by cat
-  // rather than applying it unconditionally: at cat = 0 a unit clip would cut
-  // the 9-gon's 1.042 circumradius back to a near-circle. The surviving area is
-  // therefore 1 - cat + cat*catArea(cat), not catArea alone.
-  shape *= mix(1.0, clip2, cat);
+  // A hard geometric clip, not a translucent blend: at cat = 0 the clip radius
+  // sits outside the 1.042 polygon, and at cat = 1 it is the equal-radius
+  // almond. The old mix(1, clip2, cat) left a 1-cat bright crescent.
+  float rc = 1.07 - 0.07 * cat;
+  float clip2 = smoothstep(rc + 0.025, rc - 0.025, length(q - dir * (0.60 * cat)));
+  shape *= clip2;
 
   // Mild spherical-aberration rim: bright rim on one side of focus, soft centre
   // on the other. 2r^2 - 1 has a disc mean of zero, so the profile is genuinely
@@ -655,14 +659,22 @@ vec3 fillColour(vec2 uv, float frad, float fillLod) {
   return textureLod(u_photo, zoomUV(uv), baseLod()).rgb;
 }
 
-// Exact fraction of the unit disc left by an equal-radius circle offset
-// d = 0.60*cat. The linear 1 - 0.376*cat was 11% high at cat = 0.5.
+// Exact intersection area of two circles. The cat's-eye is the unit aperture
+// clipped by a circle of radius rc = 1.07 - 0.07*cat, offset 0.60*cat; at
+// cat = 0 the clip radius is outside the 9-gon's 1.042 circumradius, so the
+// polygon is untouched. Returns the area, not the fraction.
+float catArea2(float r1, float r2, float d) {
+  if (d >= r1 + r2) return 0.0;
+  if (d <= abs(r1 - r2)) return PI * min(r1, r2) * min(r1, r2);
+  float a1 = r1 * r1 * acos(clamp((d * d + r1 * r1 - r2 * r2) / (2.0 * d * r1), -1.0, 1.0));
+  float a2 = r2 * r2 * acos(clamp((d * d + r2 * r2 - r1 * r1) / (2.0 * d * r2), -1.0, 1.0));
+  float h = 0.5 * sqrt(max((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2), 0.0));
+  return a1 + a2 - h;
+}
+
+// Equal-radius special case, kept for the shader's cat's-eye documentation.
 float catArea(float cat) {
-  float d = 0.60 * cat;
-  if (d < 1e-4) return 1.0;
-  float a = 2.0 * acos(clamp(0.5 * d, -1.0, 1.0))
-          - 0.5 * d * sqrt(max(4.0 - d * d, 0.0));
-  return a / PI;
+  return catArea2(1.0, 1.0, 0.60 * cat) / PI;
 }
 
 void main() {
@@ -733,15 +745,17 @@ void main() {
   // Equal unit circles offset by 0.60 leave a cat-dependent fraction of the
   // aperture. Divide the coverage alpha by the exact area so a vignetted pupil
   // does not make an opaque foreground transparent at the edge.
-  float shapeArea = 1.0 - catDest + catDest * catArea(catDest);
+  float rcDest = 1.07 - 0.07 * catDest;
+  float shapeArea = catArea2(1.0, rcDest, 0.60 * catDest) / PI;
   float spin = ign(gl_FragCoord.xy + vec2(float(u_layer) * 19.0, 0.0)) * TAU;
   float lod = clamp(log2(max(1.0, radius * sqrt(PI / float(u_taps)))) - 0.5, 0.0, u_maxLod);
   // Radius-stratified tap set. A destination whose own CoC is small compared
   // with the dilated gather radius gets only a handful of outer taps inside its
   // own disc, which speckles the near alpha. Allocate 24 taps to an inner disc
   // at 1.07*own in that case and keep the total area at pi*R^2.
-  int innerN = (own > 0.5 && own < 0.25 * radius) ? min(24, u_taps / 4) : 0;
-  float rInner = 1.07 * own;
+  float ownE = max(own, 0.5);
+  int innerN = (belongs > 0.01 && ownE < 0.25 * radius) ? min(24, u_taps / 4) : 0;
+  float rInner = 1.07 * ownE;
   float lodInner = clamp(log2(max(1.0, rInner * sqrt(PI / float(max(innerN, 1))))) - 0.5, 0.0, u_maxLod);
   float aInner = innerN > 0 ? PI * rInner * rInner / float(innerN) : 0.0;
   float rOuter2 = max(radius * radius - (innerN > 0 ? rInner * rInner : 0.0), 0.0);
@@ -2214,6 +2228,6 @@ void main() {
   // Headless-renderer test hook. Only with ?debug: a probe can set the state
   // and paint a frame without going through the sliders.
   if (new URLSearchParams(location.search).has("debug")) {
-    window.__dof = { S, render, requestRender, layout, updateFocusUI, updateLensUI, exportRender };
+    window.__dof = { S, render, requestRender, layout, updateFocusUI, updateLensUI, exportRender, openFile };
   }
 })();
